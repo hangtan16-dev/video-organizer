@@ -1,0 +1,4 @@
+PyQt6>=6.4.0
+opencv-python>=4.7.0
+send2trash>=1.8.0
+anthropic>=0.25.0

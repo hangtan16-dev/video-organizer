@@ -9,6 +9,9 @@ and emits progress signals so the caller can update a QProgressDialog.
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from metadata_dialog import _filename_to_queries, _try_all_backends
+from app_logger import get_logger
+from qthread_registry import register, unregister
+log = get_logger(__name__)
 
 
 class BulkMetaWorker(QThread):
@@ -20,11 +23,14 @@ class BulkMetaWorker(QThread):
         super().__init__(parent)
         self._paths = list(paths)
         self._stop  = False
+        from qthread_registry import install
+        install(self)
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        # Strong-ref management is at the creation site (qthread_registry.install).
         total     = len(self._paths)
         successes = 0
         failures  = 0
@@ -44,7 +50,8 @@ class BulkMetaWorker(QThread):
                     result = _try_all_backends(candidate)
                     if result.get('Title') or result.get('Summary'):
                         break
-            except Exception:
+            except Exception as e:
+                log.warning("metadata fetch failed for %s: %s", path, e)
                 result = {}
 
             self.item_done.emit(path, result)

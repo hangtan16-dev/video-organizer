@@ -2,3 +2,9 @@ PyQt6>=6.4.0
 opencv-python>=4.7.0
 send2trash>=1.8.0
 anthropic>=0.25.0
+
+# PyAV: direct FFmpeg binding with working HW decode on Windows
+# (D3D11VA / DXVA2 / CUDA).  The pip opencv-python wheel's FFmpeg lacks
+# these.  Used by the player panel for VR / 4K / 8K H.265 files.
+# Strongly recommended; the app gracefully falls back to OpenCV if absent.
+av>=11.0.0

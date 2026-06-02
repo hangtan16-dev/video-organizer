@@ -28,7 +28,7 @@ from PyQt6.QtGui import QFont
 # (folders + videos) all have a consistent height.
 from video_thumbnail_widget import BOTTOM_H
 
-_CB_SIZE    = 22
+_CB_SIZE    = 24
 _CB_MARGIN  = 5
 _ICON_MAX   = 80      # max folder-icon size in px before scaling to fit cell
 
@@ -124,9 +124,12 @@ class FolderThumbnailWidget(QFrame):
 
         # ── checkbox (top-right, identical position to VideoThumbnailWidget) ──
         self._checkbox = QCheckBox(self)
+        # Blue border makes the checkbox clearly visible — it is the ONLY way to
+        # select a folder (clicking the folder no longer selects).
         self._checkbox.setStyleSheet(
             "QCheckBox::indicator { width: 18px; height: 18px; }"
-            "QCheckBox { background: rgba(0,0,0,140); border-radius: 3px; }"
+            "QCheckBox { background: rgba(0,0,0,150); border: 2px solid #5a9fd4;"
+            " border-radius: 4px; padding: 1px; }"
         )
         self._checkbox.stateChanged.connect(self._on_check_changed)
         # Feature 3: connect checkbox state change to frame style update
@@ -152,10 +155,9 @@ class FolderThumbnailWidget(QFrame):
 
     # ── Feature 3: selection highlight ring ───────────────────────────────────
     def _update_frame_style(self):
-        if self._checkbox.isChecked():
-            self.setStyleSheet("QFrame { border: 2px solid #3a6fc4; border-radius: 2px; }")
-        else:
-            self.setStyleSheet("QFrame { border: 1px solid #3a3a3a; border-radius: 2px; }")
+        # No blue selection ring around the whole card — selection is shown by
+        # the checkbox (which has its own blue border). Neutral border always.
+        self.setStyleSheet("QFrame { border: 1px solid #3a3a3a; border-radius: 2px; }")
 
     # ── Feature 7: folder size and date modified ───────────────────────────────
     def set_folder_size(self, size_bytes: int):
@@ -245,10 +247,9 @@ class FolderThumbnailWidget(QFrame):
         super().mouseDoubleClickEvent(event)
 
     def mousePressEvent(self, event):
-        """Single click on the icon area toggles the checkbox."""
-        if event.button() == Qt.MouseButton.LeftButton:
-            if event.position().y() < self.height() - BOTTOM_H:
-                self._checkbox.setChecked(not self._checkbox.isChecked())
+        # Clicking the folder does NOT select it and does NOT draw a border.
+        # Selection is ONLY via the checkbox in the top-right corner. Double-
+        # click still navigates into the folder.
         super().mousePressEvent(event)
 
     def _on_check_changed(self, state: int):

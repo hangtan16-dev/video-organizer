@@ -9,6 +9,8 @@ incrementally without freezing.
 import os
 from PyQt6.QtCore import QThread, pyqtSignal
 
+from qthread_registry import register, unregister
+
 
 class FolderSizeScanner(QThread):
     """
@@ -34,12 +36,15 @@ class FolderSizeScanner(QThread):
         super().__init__(parent)
         self._paths = list(folder_paths)
         self._stop  = False
+        from qthread_registry import install
+        install(self)
 
     def stop(self):
         """Request the scanner to stop after the current folder completes."""
         self._stop = True
 
     def run(self):
+        # Strong-ref management is at the creation site (qthread_registry.install).
         for path in self._paths:
             if self._stop:
                 break

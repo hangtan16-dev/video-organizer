@@ -14,7 +14,13 @@ class AppSettings:
     }
 
     def __init__(self):
-        self._settings = QSettings('VideoOrganizer', 'VideoOrganizer')
+        # The QSettings storage location is taken from env vars so tests
+        # can redirect to an isolated namespace WITHOUT polluting the
+        # user's real Windows registry / macOS plist / Linux config.
+        # In production these are unset → defaults to 'VideoOrganizer'.
+        org = os.environ.get('VIDEO_ORGANIZER_QSETTINGS_ORG', 'VideoOrganizer')
+        app = os.environ.get('VIDEO_ORGANIZER_QSETTINGS_APP', 'VideoOrganizer')
+        self._settings = QSettings(org, app)
         app_data = os.environ.get('APPDATA', os.path.expanduser('~'))
         self._app_dir = os.path.join(app_data, 'VideoOrganizer')
         self._cache_dir = os.path.join(self._app_dir, 'thumbnails')
@@ -136,6 +142,76 @@ class AppSettings:
     @theme.setter
     def theme(self, value: str):
         self._settings.setValue('theme', value)
+
+    # ── Large-file / VR performance tuning ───────────────────────────────────
+    # Files above this size will NOT trigger hover preview — opening cv2 on a
+    # multi-GB file on HDD takes 1–2 s, which makes the UI feel laggy when the
+    # mouse just brushes past. The static thumbnail still displays; the user
+    # can double-click to play in the panel instead.
+    @property
+    def hover_preview_max_gb(self) -> float:
+        return float(self._settings.value('hover_preview_max_gb', 4.0))
+
+    @hover_preview_max_gb.setter
+    def hover_preview_max_gb(self, value: float):
+        self._settings.setValue('hover_preview_max_gb', float(value))
+
+    # ── Deprecated knobs (kept for QSettings back-compat) ────────────────────
+    # Hover preview now ALWAYS runs at the video's native FPS — these two
+    # settings are no-ops in the current code path but are preserved so a
+    # user's existing QSettings file with these values won't break.
+    # Future re-introduction of throttling can read them again.
+    @property
+    def hover_preview_fps_large(self) -> int:
+        return int(self._settings.value('hover_preview_fps_large', 8))
+
+    @hover_preview_fps_large.setter
+    def hover_preview_fps_large(self, value: int):
+        self._settings.setValue('hover_preview_fps_large', max(1, int(value)))
+
+    @property
+    def large_file_threshold_mb(self) -> int:
+        return int(self._settings.value('large_file_threshold_mb', 500))
+
+    @large_file_threshold_mb.setter
+    def large_file_threshold_mb(self, value: int):
+        self._settings.setValue('large_file_threshold_mb', max(0, int(value)))
+
+    # Enable FFmpeg hardware acceleration when available (NVDEC / D3D11 / VAAPI).
+    # Default is False because the standard pip opencv-python wheel on Windows
+    # does NOT actually ship working HW decode — it prints noisy stderr errors
+    # and SW fallback can be unreliable. video_capture_helper auto-detects the
+    # prebuilt wheel and disables HW preemptively even if this setting is True,
+    # so flipping this on only matters for custom OpenCV builds with real
+    # D3D11VA / NVDEC / VAAPI support compiled in.
+    @property
+    def use_hw_accel(self) -> bool:
+        return self._settings.value('use_hw_accel', False, type=bool)
+
+    @use_hw_accel.setter
+    def use_hw_accel(self, value: bool):
+        self._settings.setValue('use_hw_accel', bool(value))
+
+    # Number of CPU threads for software decode. 0 = auto (use all cores).
+    # Applied via the OPENCV_FFMPEG_CAPTURE_OPTIONS env var in main.py.
+    @property
+    def cpu_decode_threads(self) -> int:
+        return int(self._settings.value('cpu_decode_threads', 0))
+
+    @cpu_decode_threads.setter
+    def cpu_decode_threads(self, value: int):
+        self._settings.setValue('cpu_decode_threads', max(0, int(value)))
+
+    # ── recursive folder traversal ───────────────────────────────────────────
+    @property
+    def recursive_view(self) -> bool:
+        """When True, the grid shows every video inside the current folder
+        AND all subfolders, recursively (subfolders themselves are hidden)."""
+        return self._settings.value('recursive_view', False, type=bool)
+
+    @recursive_view.setter
+    def recursive_view(self, value: bool):
+        self._settings.setValue('recursive_view', bool(value))
 
     # ── view mode ────────────────────────────────────────────────────────────
     @property

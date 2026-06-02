@@ -1,4 +1,5 @@
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *.pyo
 *.pyd
@@ -29,3 +30,7 @@ Thumbs.db
 # App data
 *.db
 thumbnails/
+
+# Logs & local test artifacts (may contain personal file paths — never commit)
+*.log
+tests/**/.move_progress.log

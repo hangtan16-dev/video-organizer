@@ -1,10 +1,13 @@
 """
 Built-in video player panel widget.
 
-Uses _VideoPlayThread from video_thumbnail_widget to decode frames
-on a background thread and displays them via QTimer updates.
+Decodes frames on a background thread.  Prefers PyAV when available
+(better seeking and a more complete FFmpeg build for HW decode on
+Windows); falls back to OpenCV's `_VideoPlayThread` if PyAV isn't
+installed.
 
-No audio support (OpenCV limitation — the volume slider is shown but greyed out).
+No audio support (OpenCV / PyAV decode video only here — the volume
+slider is shown but greyed out).
 """
 
 import os
@@ -17,7 +20,22 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QTimer, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QPixmap, QImage, QFont
 
-from video_thumbnail_widget import _VideoPlayThread
+from video_thumbnail_widget import (
+    _VideoPlayThread, _running_play_threads, _play_thread_reaper,
+)
+from app_logger import get_logger
+
+# Prefer PyAV when installed — it has working HW decode on Windows where
+# OpenCV's bundled FFmpeg does not.  This import is best-effort; if `av`
+# isn't installed the widget transparently uses _VideoPlayThread.
+try:
+    from pyav_play_thread import _PyAVPlayThread, is_available as _pyav_available
+except Exception:
+    _PyAVPlayThread = None
+    def _pyav_available():
+        return False
+
+log = get_logger(__name__)
 
 
 class VideoPlayerWidget(QWidget):
@@ -146,18 +164,19 @@ class VideoPlayerWidget(QWidget):
         self._video_path = video_path
         self._current_frame = 0
 
-        # Probe video metadata
-        cap = cv2.VideoCapture(video_path)
-        if cap.isOpened():
+        # Probe video metadata (hw-accel where supported)
+        from video_capture_helper import open_capture
+        cap = open_capture(video_path, hw_accel=True)
+        if cap is None:
+            return
+        try:
             fps = cap.get(cv2.CAP_PROP_FPS)
             self._fps = fps if 0 < fps < 300 else 25.0
             total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
             self._total_frames = max(0, total)
             self._duration = self._total_frames / self._fps if self._fps > 0 else 0
+        finally:
             cap.release()
-        else:
-            cap.release()
-            return
 
         self._seek_slider.setRange(0, max(1, self._total_frames))
         basename = os.path.basename(video_path)
@@ -165,11 +184,35 @@ class VideoPlayerWidget(QWidget):
         self.setWindowTitle(f"Video Player – {basename}")
 
         lbl = self._frame_label
-        thread = _VideoPlayThread(
-            video_path, start_sec, lbl.width(), lbl.height()
-        )
+        # Native FPS for player panel (real-time playback).  Prefer PyAV
+        # when available — its FFmpeg has working D3D11VA / VAAPI /
+        # VideoToolbox HW decode that OpenCV's bundled FFmpeg lacks on
+        # standard pip installs.
+        if _PyAVPlayThread is not None and _pyav_available():
+            log.info("Player: using PyAV backend")
+            thread = _PyAVPlayThread(
+                video_path, start_sec, lbl.width(), lbl.height(),
+                hw_accel=True,
+            )
+        else:
+            log.info("Player: using OpenCV backend (install `av` for HW decode)")
+            thread = _VideoPlayThread(
+                video_path, start_sec, lbl.width(), lbl.height(),
+                hw_accel=True,
+            )
+        # Hold a strong reference in the global set BEFORE start() — same
+        # crash-prevention pattern as VideoThumbnailWidget._start_playback.
+        # Without this, stop() drops self._play_thread to None and the QThread
+        # Python wrapper can be GC'd while cv2.read() is still running →
+        # "QThread: Destroyed while thread is still running".
+        _running_play_threads.add(thread)
+        # Registry removal on the GUI thread (QUEUED), not via a Direct lambda
+        # inside finish(); C++ deletion handled by qthread_registry.install()
+        # in __init__. See video_thumbnail_widget._PlayThreadReaper and
+        # qthread_registry for the GIL ⊗ QThread-mutex deadlock this avoids.
+        thread.finished.connect(
+            _play_thread_reaper.reap, Qt.ConnectionType.UniqueConnection)
         thread.frame_ready.connect(self._on_frame)
-        thread.finished.connect(thread.deleteLater)
         self._play_thread = thread
         self._is_playing = True
         self._current_frame = int(start_sec * self._fps)

@@ -28,19 +28,21 @@ from PyQt6.QtWidgets import (
     QToolBar, QStatusBar, QMessageBox, QFileDialog,
     QWidget, QLabel, QSpinBox, QComboBox, QToolButton, QHBoxLayout,
     QVBoxLayout, QAbstractItemView, QLineEdit, QInputDialog,
-    QProgressDialog, QSlider, QMenu,
+    QProgressDialog, QSlider, QMenu, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QAction
 
 from app_settings import AppSettings
+from app_logger import get_logger
 from cache_manager import CacheManager
 import metadata_dialog as _metadata_dialog
+
+log = get_logger(__name__)
 from thumbnail_generator import ThumbnailGeneratorService
 from thumbnail_grid_widget import ThumbnailGridWidget
 from settings_dialog import SettingsDialog
 from breadcrumb_widget import BreadcrumbWidget
-from video_player_widget import VideoPlayerWidget
 from batch_rename_dialog import BatchRenameDialog
 from duplicate_finder_dialog import DuplicateFinderDialog
 from bulk_meta_worker import BulkMetaWorker
@@ -256,17 +258,25 @@ class _MoveWorker(QThread):
     """
     Moves (or copies) files/folders on a background thread.
 
-    Cross-drive strategy
-    ─────────────────────
-    os.rename() is tried first (atomic, instant on the same drive/filesystem).
-    If that raises OSError (different drive), we fall back to:
-      1. shutil.copy2()  – full copy with metadata
-      2. size verification  – ensures the copy is complete before touching source
-      3. source deletion (skipped when copy_only=True) with retries.
+    Strategy
+    ────────
+    1. os.rename() is tried first (atomic, instant on the same drive).
+       Retried on transient PermissionError / SharingViolation (errno EACCES
+       or Windows error 5/32) — these usually clear within ~1s once cv2 or
+       antivirus releases the handle.
+    2. On a true cross-drive error (errno EXDEV / Windows error 17) we fall
+       through to shutil.copy2() + verify + delete source.
+    3. The destination is verified against the source size before the source
+       is touched, so a partial copy never destroys data.
     """
 
-    _DELETE_RETRIES     = 5
-    _DELETE_RETRY_DELAY = 0.5   # seconds between delete retries
+    _RENAME_RETRIES     = 6
+    _RENAME_RETRY_DELAY = 0.5   # seconds between rename attempts
+    _DELETE_RETRIES     = 8
+    _DELETE_RETRY_DELAY = 0.5
+
+    # Windows error codes for "file is in use" / "access denied"
+    _WIN_BUSY_ERRNO = (5, 32)   # ACCESS_DENIED, SHARING_VIOLATION
 
     item_done = pyqtSignal(str, bool, str)   # (src_path, success, error_msg)
     all_done  = pyqtSignal(list, list)        # (moved_paths, error_strings)
@@ -276,12 +286,25 @@ class _MoveWorker(QThread):
         self._paths     = paths
         self._dest      = dest
         self._copy_only = copy_only
+        self._stop      = False
+        # Strong-ref + auto-cleanup wiring done here so every creation site
+        # benefits without having to remember to call install() separately.
+        from qthread_registry import install
+        install(self)
+
+    def stop(self):
+        """Request the worker to abort after the current file."""
+        self._stop = True
 
     def run(self):
+        # Strong-ref management is at the creation site (qthread_registry.install).
         moved, errors = [], []
         for p in self._paths:
+            if self._stop:
+                break
             err = self._move_one(p)
             if err:
+                log.warning("Move failed [%s]: %s", os.path.basename(p), err)
                 errors.append(f"{os.path.basename(p)}: {err}")
                 self.item_done.emit(p, False, err)
             else:
@@ -289,8 +312,31 @@ class _MoveWorker(QThread):
                 self.item_done.emit(p, True, '')
         self.all_done.emit(moved, errors)
 
+    @classmethod
+    def _is_busy_error(cls, exc: OSError) -> bool:
+        """True if exc is 'file is in use / permission denied' (transient)."""
+        # On Windows, .winerror is set; on POSIX, .errno is set.
+        winerr = getattr(exc, 'winerror', None)
+        if winerr in cls._WIN_BUSY_ERRNO:
+            return True
+        if isinstance(exc, PermissionError):
+            return True
+        return False
+
+    @classmethod
+    def _is_cross_device_error(cls, exc: OSError) -> bool:
+        """True if exc is 'cannot move across drives' (need copy+delete)."""
+        winerr = getattr(exc, 'winerror', None)
+        if winerr == 17:                 # ERROR_NOT_SAME_DEVICE
+            return True
+        import errno
+        if exc.errno == errno.EXDEV:
+            return True
+        return False
+
     def _move_one(self, src: str) -> str:
         """Move (or copy) src into self._dest.  Returns '' on success, error string on failure."""
+        import time
         dst = os.path.join(self._dest, os.path.basename(src))
 
         if self._copy_only:
@@ -303,12 +349,28 @@ class _MoveWorker(QThread):
             except Exception as exc:
                 return f"copy failed: {exc}"
 
-        # ── same-filesystem: atomic rename ───────────────────────────────────
-        try:
-            os.rename(src, dst)
-            return ''
-        except OSError:
-            pass   # different drive — fall through to copy+delete
+        # ── same-filesystem: atomic rename, retry on transient busy errors ───
+        last_err: OSError | None = None
+        for attempt in range(self._RENAME_RETRIES):
+            try:
+                os.rename(src, dst)
+                return ''
+            except OSError as exc:
+                last_err = exc
+                if self._is_cross_device_error(exc):
+                    break   # fall through to copy+delete
+                if not self._is_busy_error(exc):
+                    return f"rename failed: {exc}"
+                # Busy → wait and retry
+                if attempt < self._RENAME_RETRIES - 1:
+                    time.sleep(self._RENAME_RETRY_DELAY)
+
+        # If the last error wasn't a cross-device error, all retries were
+        # busy/permission-denied — give up rather than copy+delete which
+        # would also fail to delete the still-locked source.
+        if last_err is not None and not self._is_cross_device_error(last_err):
+            return (f"permission denied after {self._RENAME_RETRIES} retries — "
+                    f"is the file open in another program? ({last_err})")
 
         # ── cross-drive: copy, verify, then delete source ────────────────────
         try:
@@ -332,8 +394,7 @@ class _MoveWorker(QThread):
             pass   # if we can't stat, continue and try to delete anyway
 
         # Delete source with retries (handles lingering cv2.VideoCapture handles)
-        import time
-        last_err = ''
+        del_err = ''
         for attempt in range(self._DELETE_RETRIES):
             try:
                 if os.path.isdir(src):
@@ -342,12 +403,12 @@ class _MoveWorker(QThread):
                     os.unlink(src)
                 return ''   # success
             except OSError as exc:
-                last_err = str(exc)
+                del_err = str(exc)
                 if attempt < self._DELETE_RETRIES - 1:
                     time.sleep(self._DELETE_RETRY_DELAY)
 
         return (f"file was copied to destination but source could not be deleted "
-                f"({last_err})")
+                f"({del_err})")
 
 
 class MainWindow(QMainWindow):
@@ -355,6 +416,16 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._settings = AppSettings()
         self._cache = CacheManager(self._settings.db_path, self._settings.cache_dir)
+        # Recover thumbnails that the slow-8K-I/O churn (now bounded in
+        # thumbnail_generator) had mis-marked as permanently failed. These were
+        # slow-but-good files, not corrupt — clear the marker so they retry.
+        try:
+            _n = self._cache.clear_failures_by_reason("Repeated read failures")
+            if _n:
+                log.info("Cleared %d stale 'Repeated read failures' thumbnail "
+                         "marker(s) for retry", _n)
+        except Exception:
+            pass
         _metadata_dialog.set_cache_manager(self._cache)
         _metadata_dialog.set_custom_search_urls(self._settings.custom_search_urls)
         self._generator = ThumbnailGeneratorService(self._cache, self)
@@ -386,11 +457,6 @@ class MainWindow(QMainWindow):
         if splitter_state:
             self._splitter.restoreState(splitter_state)
 
-        # Restore player geometry
-        player_geom = self._settings.player_geometry
-        if player_geom:
-            self._player_panel.restoreGeometry(player_geom)
-
         # Open last folder
         last = self._settings.last_folder
         if last and os.path.isdir(last):
@@ -400,7 +466,8 @@ class MainWindow(QMainWindow):
     def _apply_dark_theme(self):
         self.setStyleSheet("""
             QMainWindow, QWidget { background: #1e1e1e; color: #ddd; }
-            QToolBar { background: #252525; border-bottom: 1px solid #333; spacing: 4px; }
+            QToolBar { background: #252525; border-bottom: 1px solid #333; spacing: 6px; }
+            QToolBar::separator { background: #3a3a3a; width: 1px; margin: 4px 4px; }
             QToolButton { background: #2e2e2e; border: 1px solid #3a3a3a;
                           border-radius: 3px; padding: 4px 8px; color: #ddd; }
             QToolButton:hover { background: #3a3a3a; }
@@ -411,8 +478,8 @@ class MainWindow(QMainWindow):
             QTreeWidget::item { padding: 2px; }
             QTreeWidget::item:hover { background: #2e2e2e; }
             QTreeWidget::item:selected { background: #3a6fc4; color: #fff; }
-            QScrollBar:vertical { background: #252525; width: 10px; border: none; }
-            QScrollBar::handle:vertical { background: #444; border-radius: 4px; min-height: 20px; }
+            QScrollBar:vertical { background: #252525; width: 20px; border: none; }
+            QScrollBar::handle:vertical { background: #444; border-radius: 8px; min-height: 20px; }
             QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
             QScrollBar:horizontal { background: #252525; height: 10px; border: none; }
             QScrollBar::handle:horizontal { background: #444; border-radius: 4px; }
@@ -453,12 +520,13 @@ class MainWindow(QMainWindow):
         """)
 
     def _build_toolbar(self):
+        # ══ Row 1: file ops | folder ops | layout | tools & settings ══════════
         tb = QToolBar("Main", self)
         tb.setMovable(False)
         tb.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonTextOnly)
         self.addToolBar(tb)
 
-        # ── Selection group ──────────────────────────────────────────────────
+        # ── File operations: Select, Deselect, Copy, Move, Delete, Rename, Undo
         self._act_select_all = QAction("Select All", self)
         self._act_select_all.triggered.connect(self._on_select_all)
         tb.addAction(self._act_select_all)
@@ -467,23 +535,28 @@ class MainWindow(QMainWindow):
         self._act_deselect.triggered.connect(self._on_deselect_all)
         tb.addAction(self._act_deselect)
 
-        tb.addSeparator()
-
-        # ── File operations group ────────────────────────────────────────────
-        self._act_move = QAction("Move Selected…", self)
-        self._act_move.triggered.connect(self._on_move)
-        self._act_move.setEnabled(False)
-        tb.addAction(self._act_move)
-
         self._act_copy_sel = QAction("Copy Selected…", self)
         self._act_copy_sel.triggered.connect(self._on_copy)
         self._act_copy_sel.setEnabled(False)
         tb.addAction(self._act_copy_sel)
 
+        # Move sits with Copy (its natural sibling). It wasn't in the reorder
+        # list but was never asked to be dropped, so it stays — moving files
+        # would otherwise be impossible.
+        self._act_move = QAction("Move Selected…", self)
+        self._act_move.triggered.connect(self._on_move)
+        self._act_move.setEnabled(False)
+        tb.addAction(self._act_move)
+
         self._act_delete = QAction("Delete Selected", self)
         self._act_delete.triggered.connect(self._on_delete)
         self._act_delete.setEnabled(False)
         tb.addAction(self._act_delete)
+
+        self._act_batch_rename = QAction("Rename…", self)
+        self._act_batch_rename.triggered.connect(self._on_batch_rename)
+        self._act_batch_rename.setEnabled(False)
+        tb.addAction(self._act_batch_rename)
 
         self._act_undo = QAction("Undo", self)
         self._act_undo.setShortcut("Ctrl+Z")
@@ -493,88 +566,11 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # ── Rename group ─────────────────────────────────────────────────────
-        self._act_batch_rename = QAction("Rename…", self)
-        self._act_batch_rename.triggered.connect(self._on_batch_rename)
-        self._act_batch_rename.setEnabled(False)
-        tb.addAction(self._act_batch_rename)
+        # ── Folder operations: Open Folder, Up ────────────────────────────────
+        act_open_folder = QAction("Open Folder…", self)
+        act_open_folder.triggered.connect(self._on_open_folder)
+        tb.addAction(act_open_folder)
 
-        tb.addSeparator()
-
-        # ── View group: columns slider + sort ────────────────────────────────
-        view_widget = QWidget()
-        view_layout = QHBoxLayout(view_widget)
-        view_layout.setContentsMargins(4, 0, 4, 0)
-        view_layout.setSpacing(4)
-
-        cols_lbl = QLabel("Columns:")
-        cols_lbl.setStyleSheet("color: #ccc;")
-        view_layout.addWidget(cols_lbl)
-
-        self._cols_slider = QSlider(Qt.Orientation.Horizontal)
-        self._cols_slider.setRange(1, 8)
-        self._cols_slider.setValue(self._settings.thumbnails_per_row)
-        self._cols_slider.setFixedWidth(120)
-        self._cols_slider.setStyleSheet("""
-            QSlider::groove:horizontal { height: 4px; background: #3a3a3a; border-radius: 2px; }
-            QSlider::sub-page:horizontal { background: #3a6fc4; border-radius: 2px; }
-            QSlider::handle:horizontal { width: 14px; height: 14px; margin: -5px 0;
-                background: #7ab8e8; border-radius: 7px; }
-        """)
-        self._cols_slider.valueChanged.connect(self._on_cols_changed)
-        view_layout.addWidget(self._cols_slider)
-
-        self._cols_label = QLabel(str(self._settings.thumbnails_per_row))
-        self._cols_label.setStyleSheet("color: #888; min-width: 16px;")
-        self._cols_slider.valueChanged.connect(lambda v: self._cols_label.setText(str(v)))
-        view_layout.addWidget(self._cols_label)
-
-        # Sort controls
-        sort_sep = QLabel("|")
-        sort_sep.setStyleSheet("color: #444; padding: 0 4px;")
-        view_layout.addWidget(sort_sep)
-
-        sort_lbl = QLabel("Sort:")
-        sort_lbl.setStyleSheet("color: #ccc;")
-        view_layout.addWidget(sort_lbl)
-
-        self._sort_combo = QComboBox()
-        self._sort_combo.addItems(["Name", "Date Modified", "Size", "Type", "Rating"])
-        self._sort_combo.setMinimumWidth(110)
-        self._sort_combo.setStyleSheet(
-            "QComboBox { background:#2e2e2e; color:#ddd; border:1px solid #3a3a3a;"
-            "            border-radius:3px; padding:2px 6px; }"
-            "QComboBox::drop-down { border:none; width:18px; }"
-            "QComboBox QAbstractItemView { background:#2e2e2e; color:#ddd;"
-            "                              selection-background-color:#3a6fc4; }"
-        )
-        _key_to_label = {'name': 'Name', 'modified': 'Date Modified',
-                         'size': 'Size',  'type': 'Type', 'rating': 'Rating'}
-        saved_label = _key_to_label.get(self._settings.sort_key, 'Name')
-        self._sort_combo.setCurrentText(saved_label)
-        view_layout.addWidget(self._sort_combo)
-
-        self._sort_dir_btn = QToolButton()
-        self._sort_dir_btn.setCheckable(True)
-        self._sort_dir_btn.setChecked(self._settings.sort_asc)
-        self._sort_dir_btn.setText("↑ Asc" if self._settings.sort_asc else "↓ Desc")
-        self._sort_dir_btn.setStyleSheet(
-            "QToolButton { background:#2e2e2e; border:1px solid #3a3a3a;"
-            "              border-radius:3px; padding:3px 8px; color:#ddd; }"
-            "QToolButton:hover  { background:#3a3a3a; }"
-            "QToolButton:checked { background:#3a6fc4; color:#fff; border-color:#2a5fc4; }"
-        )
-        view_layout.addWidget(self._sort_dir_btn)
-
-        tb.addWidget(view_widget)
-
-        # Connect sort controls
-        self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
-        self._sort_dir_btn.toggled.connect(self._on_sort_dir_toggled)
-
-        tb.addSeparator()
-
-        # ── Navigate group ───────────────────────────────────────────────────
         self._act_up = QAction("⬆ Up", self)
         self._act_up.setToolTip("Go up one level in the folder hierarchy")
         self._act_up.triggered.connect(self._on_go_up)
@@ -583,7 +579,66 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # ── Tools menu button ────────────────────────────────────────────────
+        # ── Layout format: Columns slider + Recursive ─────────────────────────
+        # Maximum h-policy so the toolbar can't stretch this group — keeps the
+        # slider snug next to the "Columns:" label instead of spreading out.
+        layout_widget = QWidget()
+        layout_widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Preferred)
+        layout_l = QHBoxLayout(layout_widget)
+        layout_l.setContentsMargins(4, 0, 4, 0)
+        layout_l.setSpacing(6)
+
+        cols_lbl = QLabel("Columns:")
+        cols_lbl.setStyleSheet("color: #ccc;")
+        layout_l.addWidget(cols_lbl)
+
+        self._cols_slider = QSlider(Qt.Orientation.Horizontal)
+        self._cols_slider.setRange(1, 8)
+        self._cols_slider.setValue(self._settings.thumbnails_per_row)
+        self._cols_slider.setFixedWidth(90)
+        self._cols_slider.setStyleSheet("""
+            QSlider::groove:horizontal { height: 4px; background: #3a3a3a; border-radius: 2px; }
+            QSlider::sub-page:horizontal { background: #3a6fc4; border-radius: 2px; }
+            QSlider::handle:horizontal { width: 14px; height: 14px; margin: -5px 0;
+                background: #7ab8e8; border-radius: 7px; }
+        """)
+        self._cols_slider.valueChanged.connect(self._on_cols_changed)
+        layout_l.addWidget(self._cols_slider)
+
+        self._cols_label = QLabel(str(self._settings.thumbnails_per_row))
+        self._cols_label.setStyleSheet("color: #888; min-width: 16px;")
+        self._cols_slider.valueChanged.connect(lambda v: self._cols_label.setText(str(v)))
+        layout_l.addWidget(self._cols_label)
+
+        self._recursive_btn = QToolButton()
+        self._recursive_btn.setCheckable(True)
+        self._recursive_btn.setChecked(self._settings.recursive_view)
+        self._recursive_btn.setText("🌳 Recursive")
+        self._recursive_btn.setToolTip(
+            "Show videos from this folder and all subfolders (subfolders hidden)"
+        )
+        self._recursive_btn.setStyleSheet(
+            "QToolButton { background:#2e2e2e; border:1px solid #3a3a3a;"
+            "              border-radius:3px; padding:3px 8px; color:#ddd; }"
+            "QToolButton:hover  { background:#3a3a3a; }"
+            "QToolButton:checked { background:#3a6fc4; color:#fff; border-color:#2a5fc4; }"
+        )
+        layout_l.addWidget(self._recursive_btn)
+
+        tb.addWidget(layout_widget)
+        # QToolBar IGNORES the Maximum size policy and stretches an embedded
+        # widget — which balloons the inner labels so "Columns:" drifts away
+        # from the slider. A hard maximumWidth IS respected: pin the group to
+        # its natural width so the slider stays snug against the label.
+        layout_widget.setMaximumWidth(layout_widget.sizeHint().width())
+
+        tb.addSeparator()
+
+        # ── Tools & settings: Settings, Tools ─────────────────────────────────
+        act_settings = QAction("Settings", self)
+        act_settings.triggered.connect(self._on_settings)
+        tb.addAction(act_settings)
+
         self._tools_btn = QToolButton()
         self._tools_btn.setText("Tools ▾")
         self._tools_btn.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
@@ -625,25 +680,141 @@ class MainWindow(QMainWindow):
         self._tools_btn.setMenu(tools_menu)
         tb.addWidget(self._tools_btn)
 
-        tb.addSeparator()
+        # Even out row-1 button widths (shared minimum width).
+        self._equalize_toolbar_buttons(tb)
 
-        # ── Settings / Open ──────────────────────────────────────────────────
-        act_settings = QAction("Settings", self)
-        act_settings.triggered.connect(self._on_settings)
-        tb.addAction(act_settings)
+        # ══ Row 2: folder path + filtering + sorting ══════════════════════════
+        self.addToolBarBreak()
+        tb2 = QToolBar("Filter & Sort", self)
+        tb2.setMovable(False)
+        self.addToolBar(tb2)
 
-        act_open_folder = QAction("Open Folder…", self)
-        act_open_folder.triggered.connect(self._on_open_folder)
-        tb.addAction(act_open_folder)
+        # Folder path (breadcrumb) — expands to take the row's free space.
+        self._breadcrumb = BreadcrumbWidget()
+        self._breadcrumb.navigate_requested.connect(self._navigate_to)
+        self._breadcrumb.bookmark_requested.connect(self._on_bookmark_toggle)
+        self._breadcrumb.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        tb2.addWidget(self._breadcrumb)
 
-        tb.addSeparator()
+        tb2.addSeparator()
 
-        # ── Player toggle ────────────────────────────────────────────────────
-        self._act_player = QAction("▶ Player", self)
-        self._act_player.setCheckable(True)
-        self._act_player.setChecked(False)
-        self._act_player.toggled.connect(self._on_player_toggled)
-        tb.addAction(self._act_player)
+        # Filter files — fixed width (the path takes the row's stretch).
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("🔍  Filter files…")
+        self._filter_edit.setClearButtonEnabled(True)
+        self._filter_edit.setFixedWidth(280)
+        self._filter_edit.setStyleSheet(
+            "QLineEdit { background:#2e2e2e; color:#ddd; border:1px solid #3a3a3a;"
+            "            border-radius:3px; padding:3px 8px; }"
+        )
+        self._filter_edit.textChanged.connect(self._on_filter_changed)
+        tb2.addWidget(self._filter_edit)
+
+        # Filter by rating (exact-match; "All" = off, "Unrated" = 0 stars).
+        rating_lbl = QLabel("  Rating:")
+        rating_lbl.setStyleSheet("color: #ccc;")
+        tb2.addWidget(rating_lbl)
+
+        self._rating_filter_combo = QComboBox()
+        self._rating_filter_combo.addItem("★ All", None)
+        self._rating_filter_combo.addItem("☆ Unrated", 0)
+        for _n in range(1, 6):
+            self._rating_filter_combo.addItem("★" * _n, _n)
+        self._rating_filter_combo.setToolTip(
+            "Show only videos with this exact star rating.\n"
+            "“Unrated” shows videos with zero stars / not yet rated."
+        )
+        self._rating_filter_combo.setFixedWidth(96)
+        self._rating_filter_combo.setStyleSheet(
+            "QComboBox { background:#2e2e2e; color:#ddd; border:1px solid #3a3a3a;"
+            "            border-radius:3px; padding:2px 6px; }"
+            "QComboBox::drop-down { border:none; width:18px; }"
+            "QComboBox QAbstractItemView { background:#2e2e2e; color:#ddd;"
+            "                              selection-background-color:#3a6fc4; }"
+        )
+        self._rating_filter_combo.currentIndexChanged.connect(self._on_rating_filter_changed)
+        tb2.addWidget(self._rating_filter_combo)
+
+        tb2.addSeparator()
+
+        # Sort dropdown + asc/desc toggle.
+        sort_widget = QWidget()
+        sort_l = QHBoxLayout(sort_widget)
+        sort_l.setContentsMargins(4, 0, 4, 0)
+        sort_l.setSpacing(6)
+
+        sort_lbl = QLabel("Sort:")
+        sort_lbl.setStyleSheet("color: #ccc;")
+        sort_l.addWidget(sort_lbl)
+
+        self._sort_combo = QComboBox()
+        self._sort_combo.addItems(["Name", "Date Modified", "Size", "Type", "Rating"])
+        self._sort_combo.setMinimumWidth(110)
+        self._sort_combo.setStyleSheet(
+            "QComboBox { background:#2e2e2e; color:#ddd; border:1px solid #3a3a3a;"
+            "            border-radius:3px; padding:2px 6px; }"
+            "QComboBox::drop-down { border:none; width:18px; }"
+            "QComboBox QAbstractItemView { background:#2e2e2e; color:#ddd;"
+            "                              selection-background-color:#3a6fc4; }"
+        )
+        _key_to_label = {'name': 'Name', 'modified': 'Date Modified',
+                         'size': 'Size',  'type': 'Type', 'rating': 'Rating'}
+        saved_label = _key_to_label.get(self._settings.sort_key, 'Name')
+        self._sort_combo.setCurrentText(saved_label)
+        sort_l.addWidget(self._sort_combo)
+
+        self._sort_dir_btn = QToolButton()
+        self._sort_dir_btn.setCheckable(True)
+        self._sort_dir_btn.setChecked(self._settings.sort_asc)
+        self._sort_dir_btn.setText("↑ Asc" if self._settings.sort_asc else "↓ Desc")
+        self._sort_dir_btn.setStyleSheet(
+            "QToolButton { background:#2e2e2e; border:1px solid #3a3a3a;"
+            "              border-radius:3px; padding:3px 8px; color:#ddd; }"
+            "QToolButton:hover  { background:#3a3a3a; }"
+            "QToolButton:checked { background:#3a6fc4; color:#fff; border-color:#2a5fc4; }"
+        )
+        sort_l.addWidget(self._sort_dir_btn)
+
+        tb2.addWidget(sort_widget)
+
+        # Connect view/sort controls AFTER their initial values are set, so the
+        # setCurrentText / setChecked calls above don't fire handlers that touch
+        # self._grid (which is built later, in _build_central).
+        self._sort_combo.currentTextChanged.connect(self._on_sort_changed)
+        self._sort_dir_btn.toggled.connect(self._on_sort_dir_toggled)
+        self._recursive_btn.toggled.connect(self._on_recursive_toggled)
+
+    def _equalize_toolbar_buttons(self, tb):
+        """Give every text button in the toolbar a shared MINIMUM width so the
+        narrow ones (Undo, Up, Rename…) grow to line up with the rest, for an
+        evenly distributed bar. Long labels (Move Selected…, Delete Selected)
+        still stretch past it — this is a floor, not a fixed size, so nothing
+        clips and the bar never balloons to the widest-label width (which would
+        overflow the window). The shared floor = the median natural button
+        width, computed at runtime so it tracks the actual font / DPI.
+
+        The composite view cluster (Columns slider + Sort dropdown + Recursive)
+        is added as a single widget, so its inner controls are untouched —
+        sliders/dropdowns keep their own sizes."""
+        from PyQt6.QtWidgets import QToolButton
+        buttons = [
+            tb.widgetForAction(act)
+            for act in tb.actions()
+            if not act.isSeparator()
+            and isinstance(tb.widgetForAction(act), QToolButton)
+        ]
+        if not buttons:
+            return
+        widths = sorted(b.sizeHint().width() for b in buttons)
+        # Lower-third natural width: lifts only the genuinely narrow buttons
+        # (Undo, Up, Rename…) up to it, so the worst size mismatch disappears
+        # while the delta added to the bar stays small (a higher floor would
+        # grow most buttons and risk overflowing the window).
+        floor_w = widths[len(widths) // 3]
+        for b in buttons:
+            b.setMinimumWidth(floor_w)
 
     def _build_central(self):
         # ── Horizontal splitter: [tree | right panel] ────────────────────────
@@ -657,28 +828,12 @@ class MainWindow(QMainWindow):
         self._tree.currentItemChanged.connect(self._on_tree_item_changed)
         self._splitter.addWidget(self._tree)
 
-        # Right: breadcrumb + filter + grid in a QVBoxLayout container
+        # Right: just the grid. (Folder path, filter, rating, sort all live in
+        # the second toolbar row now.)
         right_widget = QWidget(self)
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
         right_layout.setSpacing(0)
-
-        # Breadcrumb
-        self._breadcrumb = BreadcrumbWidget(right_widget)
-        self._breadcrumb.navigate_requested.connect(self._navigate_to)
-        self._breadcrumb.bookmark_requested.connect(self._on_bookmark_toggle)
-        right_layout.addWidget(self._breadcrumb)
-
-        # Filter bar
-        self._filter_edit = QLineEdit(right_widget)
-        self._filter_edit.setPlaceholderText("🔍  Filter files…")
-        self._filter_edit.setStyleSheet(
-            "QLineEdit { background: #1e1e1e; color: #ddd; border: none;"
-            "            border-bottom: 1px solid #333; padding: 4px 8px;"
-            "            border-radius: 0; }"
-        )
-        self._filter_edit.textChanged.connect(self._on_filter_changed)
-        right_layout.addWidget(self._filter_edit)
 
         # Thumbnail grid
         self._grid = ThumbnailGridWidget(self._generator, self._settings, self._cache, right_widget)
@@ -707,45 +862,15 @@ class MainWindow(QMainWindow):
         for np_path in self._settings.network_paths:
             self._tree.add_network_path(np_path)
 
-        # ── Floating player window (not embedded — independent popup) ─────────
-        self._player_panel = VideoPlayerWidget(self)   # parent=self for GC only
-        self._player_panel.closed.connect(self._on_player_closed)
-
     # ── Open video signal handler ─────────────────────────────────────────────
     @pyqtSlot(str)
     def _on_open_video(self, path: str):
-        """Open a video: use the popup player if it is open, otherwise startfile."""
-        if self._act_player.isChecked():
-            self._player_panel.play(path)
-            self._player_panel.show()
-            self._player_panel.raise_()
-            self._player_panel.activateWindow()
-        else:
-            try:
-                os.startfile(path)
-            except AttributeError:
-                import subprocess
-                subprocess.Popen(['xdg-open', path])
-
-    def _on_player_toggled(self, checked: bool):
-        """Show or hide the floating player window."""
-        if checked:
-            self._player_panel.show()
-            self._player_panel.raise_()
-            self._player_panel.activateWindow()
-        else:
-            self._settings.player_geometry = self._player_panel.saveGeometry()
-            self._player_panel.stop()
-            self._player_panel.hide()
-
-    @pyqtSlot()
-    def _on_player_closed(self):
-        """Called when the user clicks the X on the player window."""
-        self._settings.player_geometry = self._player_panel.saveGeometry()
-        # Un-check the toolbar button without re-triggering _on_player_toggled
-        self._act_player.blockSignals(True)
-        self._act_player.setChecked(False)
-        self._act_player.blockSignals(False)
+        """Open a video in the OS default player."""
+        try:
+            os.startfile(path)
+        except AttributeError:
+            import subprocess
+            subprocess.Popen(['xdg-open', path])
 
     def _build_status_bar(self):
         self._status = QStatusBar(self)
@@ -793,9 +918,7 @@ class MainWindow(QMainWindow):
         if not dest:
             return
 
-        # Cancel thumbnail generation so cv2.VideoCapture handles are released
-        # before we try to delete source files on cross-drive moves.
-        self._generator.cancel_all()
+        self._release_video_handles()
 
         # Disable move/delete buttons while the operation is in progress
         self._act_move.setEnabled(False)
@@ -823,7 +946,7 @@ class MainWindow(QMainWindow):
         if not dest:
             return
 
-        self._generator.cancel_all()
+        self._release_video_handles()
         self._act_copy_sel.setEnabled(False)
         self._status_label.setText(f"Copying {len(paths)} item(s)…")
 
@@ -840,7 +963,7 @@ class MainWindow(QMainWindow):
         )
         if not dest:
             return
-        self._generator.cancel_all()
+        self._release_video_handles()
         self._status_label.setText(f"Copying {os.path.basename(path)}…")
         self._move_worker = _MoveWorker([path], dest, copy_only=True, parent=self)
         self._move_worker.item_done.connect(self._on_copy_item_done)
@@ -856,7 +979,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(list, list)
     def _on_copy_all_done(self, copied: list, errors: list):
-        self._move_worker = None
+        self._release_move_worker()
         self._on_selection_changed(len(self._grid.get_checked_paths()))
         n = len(copied)
         self._status_label.setText(f"Copied {n} item(s).")
@@ -876,10 +999,9 @@ class MainWindow(QMainWindow):
     def _on_move_all_done(self, moved: list, errors: list):
         """Called on the main thread when all moves are complete."""
         for p in moved:
-            if os.path.isfile(p):   # skip cache invalidation for folders
-                self._cache.invalidate(p)
+            self._cache.invalidate(p)   # invalidate for both files and folders
         self._grid.remove_paths(moved)
-        self._move_worker = None    # release QThread ref so it can be GC'd
+        self._release_move_worker()
 
         # Push undo operation
         if moved:
@@ -899,6 +1021,83 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Move – errors",
                                 "Some items could not be moved:\n" + "\n".join(errors))
 
+    def _release_move_worker(self):
+        """Disconnect all signals from the current _move_worker before
+        clearing the reference. Without this, late-firing item_done/all_done
+        signals from a prior worker can land on a fresh worker's slots."""
+        w = self._move_worker
+        if w is None:
+            return
+        for sig in (w.item_done, w.all_done):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
+        self._move_worker = None
+
+    def _try_delete_with_retry(self, path: str) -> 'str | None':
+        """Delete one file/folder. Retries up to 8 times with 0.5s backoff
+        on PermissionError / sharing violation — these clear as soon as
+        cv2 / antivirus releases the handle. Returns None on success, or
+        the final error message string on permanent failure."""
+        import time
+        if not path:
+            return "empty path"
+        # Normalize separators FIRST. A network folder reached via a Qt-supplied
+        # root uses forward slashes ("//server/share/…") which, joined with
+        # os.path.join, become MIXED ("//server/share\\sub"). The Windows shell
+        # API that send2trash uses (SHCreateItemFromParsingName) cannot resolve
+        # forward-slash / mixed UNC paths, so the delete silently failed.
+        # normpath yields a proper backslash path / UNC ("\\server\share\sub").
+        path = os.path.normpath(path)
+        # Safety net: never delete a relative path (would hit the CWD).
+        if not os.path.isabs(path):
+            return f"refusing to delete non-absolute path: {path}"
+        # UNC / network share (\\server\share\…): there is no Recycle Bin on a
+        # network location, so send2trash cannot recycle it (and can hang or
+        # error). Delete it directly — that is the only option, and exactly what
+        # Windows Explorer does for network paths.
+        is_unc = path.startswith('\\\\')
+        _DELETE_RETRIES     = 8
+        _DELETE_RETRY_DELAY = 0.5
+        last_err = ''
+
+        for attempt in range(_DELETE_RETRIES):
+            try:
+                if _HAS_SEND2TRASH and not is_unc:
+                    send2trash.send2trash(path)   # local → Recycle Bin
+                else:
+                    if os.path.isdir(path):
+                        shutil.rmtree(path)
+                    else:
+                        os.remove(path)
+                return None   # success
+            except (PermissionError, OSError) as e:
+                last_err = str(e)
+                # PermissionError / WinError 5/32 → file still locked,
+                # retry. Other errors (not found, etc.) → give up.
+                winerror = getattr(e, 'winerror', None)
+                if (isinstance(e, PermissionError)
+                        or winerror in (5, 32)):
+                    if attempt < _DELETE_RETRIES - 1:
+                        time.sleep(_DELETE_RETRY_DELAY)
+                        continue
+                return last_err
+            except Exception as e:
+                # send2trash can raise its own classes — treat as terminal
+                return str(e)
+        return last_err
+
+    def _release_video_handles(self):
+        """Stop and wait for every cv2.VideoCapture handle the app holds:
+        thumbnail-generator workers AND hover-playback threads on visible
+        thumbnails.  Call before any move/copy/delete so Windows doesn't
+        refuse the operation with a sharing violation / permission denied."""
+        # 1) Cancel queued thumbnail workers and wait for the pool to drain
+        self._generator.cancel_all()
+        # 2) Stop hover-playback threads on visible thumbnails (blocking)
+        self._grid.pause_all_playback()
+
     @pyqtSlot()
     def _on_delete(self):
         paths = self._grid.get_checked_paths()
@@ -914,22 +1113,18 @@ class MainWindow(QMainWindow):
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
+        # Release any cv2 handles before delete so Windows doesn't refuse
+        self._release_video_handles()
         errors, deleted = [], []
         for p in paths:
-            try:
-                is_file = os.path.isfile(p)
-                if _HAS_SEND2TRASH:
-                    send2trash.send2trash(p)
-                else:
-                    if os.path.isdir(p):
-                        shutil.rmtree(p)
-                    else:
-                        os.remove(p)
-                if is_file:
+            err = self._try_delete_with_retry(p)
+            if err is None:
+                if os.path.isfile(p):
                     self._cache.invalidate(p)
                 deleted.append(p)
-            except Exception as e:
-                errors.append(f"{os.path.basename(p)}: {e}")
+            else:
+                log.warning("Delete failed [%s]: %s", os.path.basename(p), err)
+                errors.append(f"{os.path.basename(p)}: {err}")
         self._grid.remove_paths(deleted)
 
         # Push undo
@@ -969,7 +1164,7 @@ class MainWindow(QMainWindow):
             if not to_move:
                 QMessageBox.information(self, "Undo", "No files to undo.")
                 return
-            self._generator.cancel_all()
+            self._release_video_handles()
             self._status_label.setText(f"Undoing move of {len(to_move)} item(s)…")
             self._move_worker = _MoveWorker(to_move, back_dest, copy_only=False, parent=self)
             self._move_worker.item_done.connect(self._on_move_item_done)
@@ -978,7 +1173,7 @@ class MainWindow(QMainWindow):
 
     @pyqtSlot(list, list)
     def _on_undo_move_all_done(self, moved: list, errors: list):
-        self._move_worker = None
+        self._release_move_worker()
         self._status_label.setText(f"Undo complete: {len(moved)} item(s) restored.")
         if errors:
             QMessageBox.warning(self, "Undo – errors",
@@ -1008,6 +1203,13 @@ class MainWindow(QMainWindow):
         key = self._LABEL_TO_KEY.get(self._sort_combo.currentText(), 'name')
         self._settings.sort_asc = checked
         self._grid.set_sort(key, checked)
+
+    def _on_recursive_toggled(self, checked: bool):
+        """Toggle recursive folder traversal — shows every video file under
+        the current folder regardless of depth. Persisted to settings."""
+        # Stop hover playback before reload so cv2 handles release cleanly
+        self._release_video_handles()
+        self._grid.set_recursive(checked)
 
     @pyqtSlot()
     def _on_settings(self):
@@ -1041,6 +1243,11 @@ class MainWindow(QMainWindow):
     @pyqtSlot(str)
     def _on_filter_changed(self, text: str):
         self._grid.set_filter(text)
+
+    @pyqtSlot(int)
+    def _on_rating_filter_changed(self, _index: int):
+        # currentData() is None for "All", else the exact rating 0-5.
+        self._grid.set_rating_filter(self._rating_filter_combo.currentData())
 
     # ── batch rename ─────────────────────────────────────────────────────────────
     @pyqtSlot()
@@ -1146,6 +1353,9 @@ class MainWindow(QMainWindow):
         worker.item_done.connect(_on_item_done)
         worker.all_done.connect(_on_all_done)
         progress.canceled.connect(worker.stop)
+        # Strong-ref + auto-cleanup wiring (closes the GC-during-run() race)
+        from qthread_registry import install
+        install(worker)
         worker.start()
 
     # ── network paths ─────────────────────────────────────────────────────────
@@ -1196,7 +1406,7 @@ class MainWindow(QMainWindow):
             return
         copy_only = (reply == QMessageBox.StandardButton.No)
 
-        self._generator.cancel_all()
+        self._release_video_handles()
         self._pending_move_orig_paths = list(valid)
         self._pending_move_dest = self._current_folder
         self._move_worker = _MoveWorker(valid, self._current_folder,
@@ -1269,9 +1479,11 @@ class MainWindow(QMainWindow):
             return
         paths = [item.path for item in folder_items]
         self._status_label.setText(f"Scanning {len(paths)} folder sizes…")
+        from qthread_registry import install
         scanner = FolderSizeScanner(paths, self)
         scanner.folder_done.connect(self._on_folder_size_done)
         scanner.all_done.connect(lambda: self._status_label.setText("Folder scan complete."))
+        install(scanner)
         scanner.start()
         self._folder_scanner = scanner  # keep reference
 
@@ -1360,10 +1572,85 @@ class MainWindow(QMainWindow):
     def closeEvent(self, event):
         self._settings.window_geometry = self.saveGeometry()
         self._settings.splitter_state = self._splitter.saveState()
+
+        # ── stop all background QThreads before the window is destroyed ──────
+        # Failing to wait here causes "QThread: Destroyed while thread is still
+        # running", which crashes the process on exit.
+        _THREAD_STOP_MS = 3000   # max wait per thread
+
+        if self._folder_scanner is not None:
+            self._folder_scanner.stop()
+            self._folder_scanner.wait(_THREAD_STOP_MS)
+            self._folder_scanner = None
+
+        if self._bulk_meta_worker is not None:
+            self._bulk_meta_worker.stop()
+            self._bulk_meta_worker.wait(_THREAD_STOP_MS)
+            self._bulk_meta_worker = None
+
+        if self._move_worker is not None:
+            self._move_worker.stop()
+            self._move_worker.wait(_THREAD_STOP_MS)
+            self._release_move_worker()
+
+        # Stop all hover-playback threads inside active thumbnail widgets
+        # and wait for them to exit — this is the source of the
+        # "QThread: Destroyed while thread is still running" crash.
+        self._grid.shutdown_all_widgets()
+
+        # Cancel thumbnail workers and wait for the pool to drain
         self._generator.cancel_all()
-        if self._player_panel is not None:
-            if self._player_panel.isVisible():
-                self._settings.player_geometry = self._player_panel.saveGeometry()
-            self._player_panel.stop()
-            self._player_panel.hide()   # prevent it outliving the main window
+
+        # ── Final backstop: drain EVERY registered QThread ──────────────────
+        # shutdown_all_widgets only stops threads still referenced by an active
+        # widget's _play_thread. A hover preview that the user moved away from
+        # is stopped but may still be DRAINING, and _stop_playback already set
+        # the widget's _play_thread = None — so it's invisible there, yet still
+        # running and held alive by the registry. If we exit now it's destroyed
+        # mid-run → "QThread: Destroyed while thread is still running" → crash.
+        # The registry knows every thread; wait_all() signals stop + waits.
+        try:
+            from pyav_play_thread import PREVIEW_MANAGER
+            PREVIEW_MANAGER.cancel_all()
+        except Exception:
+            pass
+
+        # Drain pending background cache writes (ratings, watched, tags) FIRST —
+        # so the user's last few clicks survive even if we have to force-exit
+        # below. (Thumbnail workers, the cache writers, were already drained by
+        # _generator.cancel_all above.)
+        try:
+            self._cache.flush_writes(timeout=3.0)
+            self._cache.close()
+        except Exception as e:
+            log.warning("cache shutdown failed: %s", e)
+
+        # Now wait for EVERY registered QThread to actually finish. A hover
+        # preview parked inside a NATIVE, non-interruptible av.open() (bounded
+        # only by its own ~20 s timeout on a slow/busy disk) cannot observe
+        # stop() until the open returns. If we let Qt tear the QApplication down
+        # with that QThread still running, ~QThread aborts with "QThread:
+        # Destroyed while thread is still running" — the recurring crash. So if
+        # any thread is STILL stuck after the wait, skip the C++ destructors and
+        # exit the process immediately: the cache is already flushed, and the OS
+        # reclaims the stuck thread + its file handle. This is the sanctioned
+        # force-kill last resort for a worker that can't be cooperatively joined
+        # (the open is native and not interruptible, so we can't make it faster).
+        stuck = 0
+        try:
+            import qthread_registry
+            stuck = qthread_registry.wait_all(3000)
+        except Exception as e:
+            log.warning("thread drain on close failed: %s", e)
+        if stuck:
+            log.warning("%d background thread(s) still running at close — forcing "
+                        "immediate exit to avoid a QThread teardown crash", stuck)
+            try:
+                import logging
+                logging.shutdown()
+            except Exception:
+                pass
+            os._exit(0)
+
+        log.info("All background threads stopped — closing window")
         super().closeEvent(event)

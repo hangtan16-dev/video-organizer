@@ -22,6 +22,7 @@ from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from app_settings import AppSettings
 from cache_manager import CacheManager
+from qthread_registry import register, unregister
 
 try:
     import send2trash as _send2trash
@@ -72,11 +73,17 @@ class _ScanWorker(QThread):
         super().__init__()
         self._folder = folder_path
         self._stop   = False
+        from qthread_registry import install
+        install(self)
 
     def stop(self):
         self._stop = True
 
     def run(self):
+        # Strong-ref management is at the creation site (qthread_registry.install).
+        self._do_scan()
+
+    def _do_scan(self):
         exts = AppSettings.VIDEO_EXTENSIONS
         all_files: list[str] = []
 
@@ -202,11 +209,14 @@ class DuplicateFinderDialog(QDialog):
         btn_row.addWidget(btn_close)
         layout.addLayout(btn_row)
 
-        # Start scan
+        # Start scan.  install() holds a strong ref + wires finished→discard
+        # + finished→deleteLater; closes the post-run() GC race.
+        from qthread_registry import install
         self._worker = _ScanWorker(folder_path)
         self._worker.progress.connect(self._on_progress)
         self._worker.found_duplicates.connect(self._on_duplicates)
         self._worker.finished_scan.connect(self._on_scan_done)
+        install(self._worker)
         self._worker.start()
 
     def _on_progress(self, current_file: str, done: int, total: int):

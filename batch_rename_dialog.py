@@ -15,6 +15,34 @@ Usage:
 import os
 import re
 
+# Windows-reserved filename characters and reserved device names
+_INVALID_CHARS = '<>:"/\\|?*'
+_RESERVED_NAMES = frozenset({
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)),
+    *(f'LPT{i}' for i in range(1, 10)),
+})
+
+
+def _validate_filename(name: str) -> str:
+    """Return error message describing why name is invalid, or '' if valid."""
+    if not name or not name.strip():
+        return "name is empty"
+    if len(name) > 255:
+        return "name exceeds 255 characters"
+    bad = [c for c in _INVALID_CHARS if c in name]
+    if bad:
+        return f"name contains invalid characters: {''.join(set(bad))}"
+    # Trailing dots/spaces are illegal on Windows
+    if name.endswith(' ') or name.endswith('.'):
+        return "name cannot end with a space or dot"
+    # Reserved device names (case-insensitive, with or without extension)
+    stem = os.path.splitext(name)[0].upper()
+    if stem in _RESERVED_NAMES:
+        return f"'{stem}' is a reserved Windows name"
+    return ''
+
+
 from PyQt6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QPushButton, QTableWidget, QTableWidgetItem, QHeaderView,
@@ -149,21 +177,29 @@ class BatchRenameDialog(QDialog):
 
     def _refresh_preview(self):
         new_names = self._compute_new_names()
+        any_invalid = False
         for row, (path, new_name) in enumerate(zip(self._paths, new_names)):
             orig_item = QTableWidgetItem(os.path.basename(path))
             orig_item.setForeground(Qt.GlobalColor.gray)
             new_item  = QTableWidgetItem(new_name)
             is_same = (os.path.basename(path) == new_name)
-            new_item.setForeground(
-                Qt.GlobalColor.gray if is_same else Qt.GlobalColor.white
-            )
+
+            err = _validate_filename(new_name)
+            if err:
+                any_invalid = True
+                new_item.setForeground(Qt.GlobalColor.red)
+                new_item.setToolTip(f"Invalid: {err}")
+            else:
+                new_item.setForeground(
+                    Qt.GlobalColor.gray if is_same else Qt.GlobalColor.white
+                )
             self._table.setItem(row, 0, orig_item)
             self._table.setItem(row, 1, new_item)
 
-        # Enable rename only if at least one name changes
+        # Enable rename only if at least one name changes AND none are invalid
         has_change = any(os.path.basename(p) != n
                          for p, n in zip(self._paths, new_names))
-        self._btn_rename.setEnabled(has_change)
+        self._btn_rename.setEnabled(has_change and not any_invalid)
 
     # ── rename ─────────────────────────────────────────────────────────────────
     def _do_rename(self):
@@ -174,6 +210,10 @@ class BatchRenameDialog(QDialog):
         for path, new_name in zip(self._paths, new_names):
             if os.path.basename(path) == new_name:
                 continue  # nothing to do
+            err = _validate_filename(new_name)
+            if err:
+                errors.append(f"{os.path.basename(path)} → {new_name}: {err}")
+                continue
             parent = os.path.dirname(path)
             dest   = os.path.join(parent, new_name)
             try:

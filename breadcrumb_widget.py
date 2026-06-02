@@ -2,7 +2,6 @@
 Breadcrumb navigation widget.
 
 Shows the current folder path as clickable path segments separated by ›.
-A pin button on the right allows bookmarking the current path.
 """
 
 import os
@@ -49,30 +48,15 @@ class BreadcrumbWidget(QWidget):
         self._scroll.setWidget(self._crumb_widget)
         outer.addWidget(self._scroll)
 
-        # Pin/bookmark button
-        self._pin_btn = QPushButton("📌", self)
-        self._pin_btn.setFixedSize(26, 26)
-        self._pin_btn.setToolTip("Bookmark this folder")
-        self._pin_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; font-size: 14px; }"
-            "QPushButton:hover { background: #3a3a3a; border-radius: 3px; }"
-        )
-        self._pin_btn.clicked.connect(self._on_pin_clicked)
-        outer.addWidget(self._pin_btn)
-
     def set_path(self, path: str):
         """Rebuild breadcrumb segments from path."""
         self._current_path = path
         self._rebuild_crumbs(path)
 
     def set_bookmarked(self, bookmarked: bool):
-        """Update pin button appearance based on bookmark state."""
+        """Kept for API compatibility. The pin/bookmark button was removed, so
+        there is no visual to update — just record the state."""
         self._is_bookmarked = bookmarked
-        self._pin_btn.setStyleSheet(
-            "QPushButton { background: transparent; border: none; font-size: 14px; "
-            + ("color: #f0c040; }" if bookmarked else "color: #ddd; }")
-            + "QPushButton:hover { background: #3a3a3a; border-radius: 3px; }"
-        )
 
     def _rebuild_crumbs(self, path: str):
         """Remove existing crumb buttons and add new ones for the given path."""
@@ -135,7 +119,3 @@ class BreadcrumbWidget(QWidget):
         self._scroll.horizontalScrollBar().setValue(
             self._scroll.horizontalScrollBar().maximum()
         )
-
-    def _on_pin_clicked(self):
-        if self._current_path:
-            self.bookmark_requested.emit(self._current_path)

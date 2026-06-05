@@ -344,6 +344,9 @@ class ThumbnailGridWidget(QScrollArea):
         # ── scroll position memory (bounded) ─────────────────────────────────
         self._folder_scroll:       dict[str, int] = {}
         self._current_folder_path: str            = ''
+        # True once the user scrolls after a folder load — used to NOT yank the
+        # scroll back to the remembered position if they've already taken over.
+        self._user_scrolled_since_load: bool      = False
 
         # ── drag start position (drag-from support) ──────────────────────────
         self._drag_start_pos = None
@@ -464,6 +467,7 @@ class ThumbnailGridWidget(QScrollArea):
 
         self._current_folder_path = folder_path
         self._scanning_folder     = folder_path
+        self._user_scrolled_since_load = False
 
         # Cancel any in-flight scan first so it short-circuits quickly.
         self._scan_worker.cancel()
@@ -969,10 +973,11 @@ class ThumbnailGridWidget(QScrollArea):
             QTimer.singleShot(0, lambda: self._create_next_batch(folder_path))
         else:
             self.status_message.emit(self._items_summary())
-            # Restore saved scroll position for this folder
+            # Restore saved scroll position for this folder — but only if the
+            # user hasn't already started scrolling during the load.
             saved = self._folder_scroll.get(folder_path, 0)
             if saved > 0:
-                QTimer.singleShot(50, lambda: self.verticalScrollBar().setValue(saved))
+                QTimer.singleShot(50, lambda: self._restore_folder_scroll(saved))
 
     # ── layout ─────────────────────────────────────────────────────────────────
     def resizeEvent(self, event):
@@ -991,7 +996,18 @@ class ThumbnailGridWidget(QScrollArea):
         return not self._item_matches_filter(item)
 
     def _full_relayout(self):
-        """Recompute every item's geometry, resize the canvas, refresh widgets."""
+        """Recompute every item's geometry, resize the canvas, refresh widgets.
+
+        A scroll ANCHOR (the item under the top of the viewport) is captured
+        before re-flowing and re-pinned afterwards, so row-height changes — e.g.
+        a thumbnail arriving and replacing the 16:9 placeholder aspect ratio for
+        an item ABOVE the viewport — don't shift what the user is looking at.
+        Without this the grid visibly "jumps" (usually upward, since VR
+        thumbnails are taller than 16:9) while scrolling a folder whose
+        thumbnails are still generating."""
+        bar = self.verticalScrollBar()
+        anchor_idx, anchor_delta = self._capture_scroll_anchor(bar.value())
+
         n = max(1, self._settings.thumbnails_per_row)
         vp_w = self.viewport().width()
         vp_h = self.viewport().height()
@@ -1028,6 +1044,10 @@ class ThumbnailGridWidget(QScrollArea):
         # Resize virtual canvas to fit all items
         self._container.resize(vp_w, max(y, vp_h))
 
+        # Re-pin the scroll anchor so this relayout doesn't move the content
+        # currently under the viewport (no-op when scrolled to the very top).
+        self._restore_scroll_anchor(anchor_idx, anchor_delta)
+
         # Empty-state overlay for filter
         visible_count = sum(1 for g in self._layout_cache if g != _FILTERED_SENTINEL)
         if visible_count == 0 and self._items:
@@ -1039,6 +1059,57 @@ class ThumbnailGridWidget(QScrollArea):
         else:
             self._empty_label.hide()
 
+        self._update_active_widgets()
+
+    def _capture_scroll_anchor(self, sv: int) -> 'tuple[int | None, int]':
+        """Identify the item at the top of the viewport and how far the viewport
+        top sits below that item's top, from the CURRENT layout. Returns
+        (anchor_idx, delta). (None, 0) when at the top or empty — no pinning
+        needed. The layout cache is row-major (increasing y), so we take the
+        last item whose top is at/above the scroll value and stop."""
+        if sv <= 0 or not self._layout_cache:
+            return None, 0
+        anchor_idx = None
+        anchor_y = 0
+        for idx, rect in enumerate(self._layout_cache):
+            if rect == _FILTERED_SENTINEL:
+                continue
+            y = rect[1]
+            if y <= sv:
+                anchor_idx, anchor_y = idx, y
+            else:
+                break
+        if anchor_idx is None:
+            return None, 0
+        return anchor_idx, sv - anchor_y
+
+    def _restore_scroll_anchor(self, anchor_idx: 'int | None', anchor_delta: int):
+        """Re-pin the captured anchor item to the same viewport offset after a
+        relayout — WITHOUT emitting valueChanged, so it isn't mistaken for a
+        user scroll (which would stop previews / re-trigger work)."""
+        if anchor_idx is None or anchor_idx >= len(self._layout_cache):
+            return
+        rect = self._layout_cache[anchor_idx]
+        if rect == _FILTERED_SENTINEL:
+            return
+        bar = self.verticalScrollBar()
+        target = max(0, rect[1] + anchor_delta)
+        if target == bar.value():
+            return
+        blocked = bar.blockSignals(True)
+        bar.setValue(target)
+        bar.blockSignals(blocked)
+
+    def _restore_folder_scroll(self, saved: int):
+        """Return to the scroll position last seen in this folder — unless the
+        user has already taken over scrolling since the load began (in which
+        case yanking them back would itself be the 'jumps on its own' glitch)."""
+        if self._user_scrolled_since_load:
+            return
+        bar = self.verticalScrollBar()
+        blocked = bar.blockSignals(True)
+        bar.setValue(saved)
+        bar.blockSignals(blocked)
         self._update_active_widgets()
 
     def _buffered_visible_range(self) -> tuple[int, int]:
@@ -1218,6 +1289,9 @@ class ThumbnailGridWidget(QScrollArea):
 
     # ── scroll handling ─────────────────────────────────────────────────────────
     def _on_scroll(self, _value: int):
+        # The user has taken over scrolling — don't auto-restore to the
+        # remembered folder position out from under them.
+        self._user_scrolled_since_load = True
         # Scrolling is a foreground UI activity and must take priority over
         # disk work. The instant the user scrolls, tell the disk coordinator
         # to abort in-flight thumbnail generation and keep background parked

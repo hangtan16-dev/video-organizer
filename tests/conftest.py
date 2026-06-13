@@ -39,6 +39,12 @@ os.environ['VIDEO_ORGANIZER_QSETTINGS_APP'] = (
     f'TestSession_{uuid.uuid4().hex[:12]}'
 )
 
+# The app hard-exits (os._exit) on window close in production to dodge the
+# QThread teardown crash. Under tests that would kill the pytest runner when a
+# MainWindow fixture tears down via w.close(), so disable it — tests have no
+# stuck native workers, and a graceful close is safe for them.
+os.environ['VORG_NO_HARD_EXIT'] = '1'
+
 
 @pytest.fixture(autouse=True)
 def _isolate_app_logger(tmp_path, monkeypatch):

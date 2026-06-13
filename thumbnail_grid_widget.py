@@ -911,6 +911,20 @@ class ThumbnailGridWidget(QScrollArea):
         checked = self.get_checked_paths()
         if not checked:
             return
+        # QDrag.exec() below runs a NESTED modal event loop that re-entrantly
+        # processes queued signals — hover-preview thread finish/start, relayouts
+        # from thumbnails arriving, etc. — while the normal loop is suspended.
+        # That re-entrant thread churn is a teardown hazard (the recurring
+        # "QThread: Destroyed while running" crash recurs during select+hover+
+        # drag-heavy browsing, which is the only time this path runs — it needs
+        # items checked). Quiesce previews + park background disk work FIRST so
+        # nothing churns inside the nested loop.
+        try:
+            self._stop_all_previews()
+            from disk_coordinator import COORDINATOR
+            COORDINATOR.note_ui_activity()
+        except Exception:
+            pass
         drag = QDrag(self)
         mime = QMimeData()
         urls = [QUrl.fromLocalFile(p) for p in checked]

@@ -35,6 +35,8 @@ import time as _time
 
 import numpy as np
 
+import vr_unwarp as vu
+
 try:
     import av
     HAS_PYAV = True
@@ -147,6 +149,8 @@ class _PreviewManager:
         NOT started) become the one live preview. Supersedes any pending
         request. Starts immediately if nothing is running; otherwise stops
         the current one and starts this when it finishes."""
+        if self._pending is not None and self._pending is not thread:
+            self._discard_pending(self._pending)   # superseded before it launched
         self._pending = thread
         cur = self._current
         if cur is not None:
@@ -187,10 +191,13 @@ class _PreviewManager:
         widget's preview). If None, cancel unconditionally."""
         if thread is not None:
             if self._pending is thread:
+                self._discard_pending(self._pending)
                 self._pending = None
             if self._current is not thread:
                 return
         else:
+            if self._pending is not None:
+                self._discard_pending(self._pending)
             self._pending = None
         cur = self._current
         if cur is not None:
@@ -201,6 +208,8 @@ class _PreviewManager:
 
     def cancel_all(self) -> None:
         """Drop any pending and stop the current — used on scroll/teardown."""
+        if self._pending is not None:
+            self._discard_pending(self._pending)
         self._pending = None
         cur = self._current
         if cur is not None:
@@ -208,6 +217,32 @@ class _PreviewManager:
                 cur.stop()
             except (RuntimeError, AttributeError):
                 pass
+
+    @staticmethod
+    def _discard_pending(t) -> None:
+        """Clean up a preview thread that was built + registered but is being
+        superseded/cancelled BEFORE it ever start()ed. It never runs, so it
+        would otherwise linger in the strong-ref registries forever (it never
+        finishes → the reaper, which now reaps only FINISHED threads, never
+        touches it). It is not running, so deleting it now is safe — and removing
+        it from the registries means a never-started thread can't be revived."""
+        if t is None:
+            return
+        try:
+            from video_thumbnail_widget import _running_play_threads
+            _running_play_threads.discard(t)
+        except Exception:
+            pass
+        try:
+            import qthread_registry
+            qthread_registry.unregister(t)
+        except Exception:
+            pass
+        try:
+            if not t.isRunning() and not t.isFinished():
+                t.deleteLater()
+        except (RuntimeError, AttributeError):
+            pass
 
 
 # Process-wide singleton: at most ONE preview thread alive across all widgets.
@@ -273,6 +308,10 @@ class _PyAVPlayThread(QThread):
         self._disp_w      = display_w
         self._disp_h      = display_h
         self._stop_flag   = False
+        # VR → 2D: detected lazily from the first frame's full size ('?' = not yet
+        # checked; None = not VR; 'left' etc. = un-warp this eye).
+        self._vr_eye      = '?'
+        self._vr_unwarper = None
         self._seek_to: 'float | None' = None
         # Video timestamp (seconds) of the most recently EMITTED frame — lets
         # callers/tests observe true playback progress (for the real-time
@@ -687,6 +726,32 @@ class _PyAVPlayThread(QThread):
         finally:
             self._disp_w, self._disp_h = save_w, save_h
 
+    def _maybe_unwarp(self, arr, src_w, src_h):
+        """If the source is a side-by-side VR frame, return a flat 16:9 un-warped
+        eye; otherwise return arr unchanged. Detection + unwarper build happen
+        once; any failure falls back to the raw frame."""
+        try:
+            eye = self._vr_eye
+        except (AttributeError, RuntimeError):
+            return arr           # not fully initialised (unit-test __new__) → no-op
+        if eye == '?':
+            eye = vu.detect_stereo_eye(src_w, src_h)
+            self._vr_eye = eye
+            if eye is not None:
+                try:
+                    from vr_frame import for_path
+                    self._vr_unwarper = for_path(self._path, eye=eye)
+                except Exception as e:
+                    log.debug("preview unwarper init failed: %s", e)
+                    self._vr_eye = None
+        if getattr(self, '_vr_unwarper', None) is None:
+            return arr
+        try:
+            return np.ascontiguousarray(self._vr_unwarper.apply(arr))
+        except Exception as e:
+            log.debug("preview un-warp failed: %s", e)
+            return arr
+
     def _frame_to_qimage(self, frame) -> 'QImage | None':
         """Scale-and-convert PyAV frame to RGB888 QImage at display size.
         Uses libswscale via PyAV's reformat() (SIMD-accelerated)."""
@@ -714,6 +779,11 @@ class _PyAVPlayThread(QThread):
                     arr = cv2.resize(arr, (nw, nh), interpolation=cv2.INTER_LINEAR)
             except Exception:
                 return None
+
+        # VR side-by-side → flatten to one un-warped eye (same look as the
+        # player + the static thumbnail). Detected once from the FULL source
+        # size; the remap is cached inside the unwarper.
+        arr = self._maybe_unwarp(arr, fw, fh)
 
         # Build a FULLY SELF-CONTAINED QImage (deep copy of the pixels).
         #

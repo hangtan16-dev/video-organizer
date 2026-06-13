@@ -38,6 +38,12 @@ import os
 import time as _time
 
 import cv2
+import numpy as np
+
+import vr_unwarp as vu
+from vr_frame import for_path as _make_frame_unwarper
+from app_logger import get_logger
+log = get_logger(__name__)
 
 from PyQt6.QtWidgets import (
     QFrame, QLabel, QCheckBox, QSlider, QMenu, QDialog,
@@ -100,11 +106,18 @@ class _PlayThreadReaper(QObject):
     @pyqtSlot()
     def reap(self) -> None:
         for t in list(_running_play_threads):
+            # Only drop threads that RAN and FINISHED — not ones merely "not
+            # running". A preview thread handed to PREVIEW_MANAGER may be built
+            # but not yet started (its start is deferred until the current
+            # preview exits); isRunning() is False for it, but it will start
+            # later. Dropping it here (and letting the registry deleteLater it)
+            # is the use-after-free that aborts with "QThread: Destroyed while
+            # thread is still running". isFinished() is True only post-run().
             try:
-                still = t.isRunning()
+                done = t.isFinished()
             except RuntimeError:
-                still = False   # C++ object already gone
-            if not still:
+                done = True   # C++ object already gone
+            if done:
                 _running_play_threads.discard(t)
 
 
@@ -566,6 +579,17 @@ class VideoThumbnailWidget(QFrame):
         self._stars_widget = _StarsWidget(self)
         self._stars_widget.rating_changed.connect(self._on_star_rating_changed)
 
+        # Children must NOT take keyboard focus. A focused child (e.g. the
+        # checkbox right after you click it) makes the enclosing QScrollArea
+        # auto-scroll to keep that widget visible — so when you then scroll away,
+        # the view is yanked back to it: the "scroll jumps back up" glitch
+        # (reproduced: focusing a card's checkbox then scrolling teleported the
+        # view by tens of thousands of px). Mouse clicks still work with NoFocus;
+        # only the focus that drives QScrollArea.ensureWidgetVisible is removed.
+        # The grid itself keeps StrongFocus for keyboard navigation.
+        for _w in (self._checkbox, self._seek_slider, self._stars_widget):
+            _w.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
         # ── Feature 17: watched badge ─────────────────────────────────────────
         self._watched_badge = QLabel("✓", self)
         self._watched_badge.setStyleSheet(
@@ -640,6 +664,15 @@ class VideoThumbnailWidget(QFrame):
         else:
             return
 
+        # VR side-by-side thumbnail → show the flat (one-eye, un-warped) view,
+        # matching the in-app player. Detected by the (aspect-preserving)
+        # thumbnail shape; done once, cheap on a small image. Any failure falls
+        # back to the raw thumbnail so a normal card is never broken.
+        if vu.is_sbs_aspect(pix.width(), pix.height()):
+            flat = self._unwarp_thumb_pixmap(pix)
+            if flat is not None and not flat.isNull():
+                pix = flat
+
         self._full_pixmap = pix
         self._invalidate_display_cache()
 
@@ -657,6 +690,26 @@ class VideoThumbnailWidget(QFrame):
 
         if not self._hovering:
             self._show_static_thumbnail()
+
+    def _unwarp_thumb_pixmap(self, pix):
+        """Crop to one eye + reproject a side-by-side VR thumbnail to a flat 16:9
+        QPixmap (stereographic 220°), the same as the fullscreen player. Returns
+        None on any error (caller keeps the raw thumbnail)."""
+        try:
+            img = pix.toImage().convertToFormat(QImage.Format.Format_RGB888)
+            w, h, bpl = img.width(), img.height(), img.bytesPerLine()
+            ptr = img.constBits(); ptr.setsize(h * bpl)
+            arr = (np.frombuffer(ptr, np.uint8).reshape(h, bpl)[:, :w * 3]
+                   .reshape(h, w, 3))
+            if getattr(self, '_thumb_unwarper', None) is None:
+                self._thumb_unwarper = _make_frame_unwarper(self.video_path, eye='left')
+            flat = np.ascontiguousarray(self._thumb_unwarper.apply(arr))
+            oh, ow = flat.shape[:2]
+            qi = QImage(flat.data, ow, oh, ow * 3, QImage.Format.Format_RGB888).copy()
+            return QPixmap.fromImage(qi)
+        except Exception as e:
+            log.debug("VR thumbnail un-warp failed: %s", e)
+            return None
 
     def set_checked(self, checked: bool):
         self._checkbox.setChecked(checked)

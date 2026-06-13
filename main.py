@@ -39,6 +39,13 @@ os.environ.setdefault(
     'threads;0|thread_type;slice',
 )
 
+# ── Force the FFmpeg multimedia backend for the in-app full-screen player ──
+# Qt 6.5+ ships a bundled-FFmpeg QMediaPlayer backend with D3D11VA HW decode
+# AND built-in HEVC/H.265, so 8K VR HEVC plays smoothly without the Windows
+# "HEVC Video Extensions" store codec. Set explicitly (before QApplication) so
+# playback is deterministic regardless of any system default.
+os.environ.setdefault('QT_MEDIA_BACKEND', 'ffmpeg')
+
 # Ensure the script's directory is on sys.path so all local modules resolve.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -174,9 +181,36 @@ def _expected_decode_threads(opts: str) -> str:
         return "unknown"
 
 
+_CRASH_FILE = None   # keep the crash-dump file handle alive for the app's life
+
+
+def _enable_crash_dumps():
+    """Dump the native, all-thread C traceback to crash.log on a hard crash
+    (segfault / abort) — e.g. the use-after-free that can follow the Qt warning
+    "QThread: Destroyed while thread is still running". app.log only captures
+    that *warning* (via the Qt message handler), NOT the native stack that shows
+    WHICH thread died — this fills the gap so the next crash is diagnosable."""
+    global _CRASH_FILE
+    try:
+        import faulthandler
+        import datetime
+        crash_dir = os.path.dirname(log_path())
+        os.makedirs(crash_dir, exist_ok=True)
+        crash_path = os.path.join(crash_dir, 'crash.log')
+        _CRASH_FILE = open(crash_path, 'a', buffering=1, encoding='utf-8')
+        _CRASH_FILE.write(
+            f"\n===== session {datetime.datetime.now():%Y-%m-%d %H:%M:%S} =====\n")
+        _CRASH_FILE.flush()
+        faulthandler.enable(file=_CRASH_FILE, all_threads=True)
+        log.info("Native crash dumps enabled → %s", crash_path)
+    except Exception as e:
+        log.warning("Could not enable crash dumps: %s", e)
+
+
 def main():
     sys.excepthook = _excepthook
     qInstallMessageHandler(_qt_message_handler)
+    _enable_crash_dumps()
     log.info("=" * 60)
     log.info("Video Organizer starting  (log: %s)", log_path())
     # Request 1 ms Windows scheduler resolution so QThread.msleep is
@@ -283,22 +317,27 @@ def _log_simd_status():
             stuck = qthread_registry.wait_all(3000)
         except Exception:
             log.warning("aboutToQuit thread drain failed", exc_info=True)
+        # ALWAYS hard-exit (see MainWindow.closeEvent for the full rationale):
+        # even with 0 stuck, a QThread finishing in its finish() window — or a
+        # timer arming a new preview — can be destroyed mid-run during Qt's
+        # teardown and abort with "QThread: Destroyed while thread is still
+        # running". State is already persisted, so skip the C++ destructors.
+        # (On the normal window-close path closeEvent already os._exit'd before
+        # this runs; this covers app.quit()/menu-quit paths that bypass it.)
         if stuck:
-            # A worker (almost always a hover-preview QThread parked inside a
-            # native, non-interruptible av.open()) did not exit in time. Letting
-            # Qt destroy it now → "QThread: Destroyed while thread is still
-            # running" abort. State is already persisted, so force-exit before
-            # the C++ destructors run. See MainWindow.closeEvent for the full
-            # rationale; this is the backstop for quit paths that skip it.
-            log.warning("%d background thread(s) still running at quit — forcing "
-                        "immediate process exit to avoid a QThread teardown crash",
+            log.warning("%d background thread(s) still running at quit — hard exit",
                         stuck)
-            try:
-                import logging
-                logging.shutdown()
-            except Exception:
-                pass
-            os._exit(0)
+        try:
+            if window is not None and getattr(window, '_settings', None) is not None:
+                window._settings.sync()
+        except Exception:
+            pass
+        try:
+            import logging
+            logging.shutdown()
+        except Exception:
+            pass
+        os._exit(0)
     app.aboutToQuit.connect(_drain_threads_on_quit)
 
     code = app.exec()

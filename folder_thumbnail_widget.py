@@ -134,6 +134,10 @@ class FolderThumbnailWidget(QFrame):
         self._checkbox.stateChanged.connect(self._on_check_changed)
         # Feature 3: connect checkbox state change to frame style update
         self._checkbox.stateChanged.connect(lambda state: self._update_frame_style())
+        # NoFocus: a focused checkbox makes the enclosing QScrollArea auto-scroll
+        # to keep it visible → scrolling away yanks the view back ("scroll jumps
+        # back up"). Clicks still toggle it; only focus-driven auto-scroll is gone.
+        self._checkbox.setFocusPolicy(Qt.FocusPolicy.NoFocus)
 
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self._show_context_menu)

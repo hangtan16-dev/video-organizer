@@ -75,11 +75,20 @@ class _Reaper(QObject):
         # deleteLater() won't trigger ~QThread::wait(), and dropping the strong
         # ref can't race the C++ teardown.
         for t in list(_running):
+            # Reap ONLY threads that actually RAN and FINISHED — NOT ones that
+            # merely aren't running. A preview thread can be built + registered
+            # but not yet started (PREVIEW_MANAGER defers its start until the
+            # current preview exits); such a thread has isRunning()==False but
+            # WILL be started later. The old `not isRunning()` test deleteLater'd
+            # those pending threads, and PREVIEW_MANAGER._launch() then called
+            # start() on a deleted QThread → "QThread: Destroyed while thread is
+            # still running" → process abort (0xC0000409). isFinished() is True
+            # only after run() has returned, so it never matches a pending one.
             try:
-                still_running = t.isRunning()
+                done = t.isFinished()
             except RuntimeError:
-                still_running = False   # underlying C++ object already gone
-            if not still_running:
+                done = True             # underlying C++ object already gone
+            if done:
                 _running.discard(t)
                 try:
                     t.deleteLater()

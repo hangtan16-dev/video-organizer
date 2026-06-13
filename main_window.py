@@ -93,6 +93,11 @@ class _UndoOp:
     kind:       str          # 'move' | 'delete'
     orig_paths: list         # original source paths
     dest:       str = ''     # destination folder (for 'move')
+    dest_paths: list = None  # ACTUAL final paths at dest (parallel to orig_paths);
+                             # may differ from dest/basename when a name collision
+                             # forced a unique "name (1).ext" — undo needs the real
+                             # path so it moves OUR file back, not a pre-existing
+                             # same-named file already in the destination folder.
 
 
 class _FolderTree(QTreeWidget):
@@ -287,6 +292,9 @@ class _MoveWorker(QThread):
         self._dest      = dest
         self._copy_only = copy_only
         self._stop      = False
+        # src -> ACTUAL destination path used (recorded on success). Lets the
+        # caller build a correct Undo even when a collision forced a unique name.
+        self.moved_to: dict = {}
         # Strong-ref + auto-cleanup wiring done here so every creation site
         # benefits without having to remember to call install() separately.
         from qthread_registry import install
@@ -334,10 +342,54 @@ class _MoveWorker(QThread):
             return True
         return False
 
+    @staticmethod
+    def _unique_dest(dst: str) -> str:
+        """Return a destination path that does NOT already exist. If `dst` is
+        free, return it unchanged; otherwise append ' (1)', ' (2)', … before the
+        extension ('clip.mp4' → 'clip (1).mp4'). This is what makes a name
+        collision succeed without either failing the move (os.rename → WinError
+        183 'already exists') or silently overwriting the existing file
+        (shutil.copy2 happily clobbers → data loss)."""
+        if not os.path.exists(dst):
+            return dst
+        head, tail = os.path.split(dst)
+        root, ext = os.path.splitext(tail)
+        i = 1
+        while True:
+            candidate = os.path.join(head, f"{root} ({i}){ext}")
+            if not os.path.exists(candidate):
+                return candidate
+            i += 1
+
     def _move_one(self, src: str) -> str:
-        """Move (or copy) src into self._dest.  Returns '' on success, error string on failure."""
+        """Move (or copy) src into self._dest.  Returns '' on success, error string on failure.
+
+        Hardened for the "move fails often / unreliable" report:
+          • paths are normalized first (a Qt forward-slash path like
+            'D:/Videos/x.mp4' no longer confuses os.rename),
+          • a destination name COLLISION no longer fails the move (os.rename →
+            WinError 183) nor silently overwrites the existing file (shutil.copy2
+            clobbers = data loss): we pick a unique 'name (1).ext' so the
+            operation always succeeds without losing data,
+          • moving an item into the folder it already lives in is a no-op
+            success, not an attempted self-rename.
+        The actual destination used is recorded in self.moved_to[src] so Undo can
+        locate the file even when it was given a unique name."""
         import time
-        dst = os.path.join(self._dest, os.path.basename(src))
+        orig = src
+        src = os.path.normpath(src)
+        dest_dir = os.path.normpath(self._dest)
+        dst = os.path.join(dest_dir, os.path.basename(src))
+
+        # Already in the destination folder → nothing to do. (Must short-circuit
+        # BEFORE _unique_dest, else we'd needlessly rename it to 'name (1)'.)
+        if os.path.normcase(os.path.dirname(src)) == os.path.normcase(dest_dir):
+            self.moved_to[orig] = src
+            return ''
+
+        # Never clobber a different file already at the destination, and never
+        # fail on the collision — move/copy lands under a unique name instead.
+        dst = self._unique_dest(dst)
 
         if self._copy_only:
             try:
@@ -345,6 +397,7 @@ class _MoveWorker(QThread):
                     shutil.copytree(src, dst)
                 else:
                     shutil.copy2(src, dst)
+                self.moved_to[orig] = dst
                 return ''
             except Exception as exc:
                 return f"copy failed: {exc}"
@@ -354,6 +407,7 @@ class _MoveWorker(QThread):
         for attempt in range(self._RENAME_RETRIES):
             try:
                 os.rename(src, dst)
+                self.moved_to[orig] = dst
                 return ''
             except OSError as exc:
                 last_err = exc
@@ -401,6 +455,7 @@ class _MoveWorker(QThread):
                     shutil.rmtree(src)
                 else:
                     os.unlink(src)
+                self.moved_to[orig] = dst
                 return ''   # success
             except OSError as exc:
                 del_err = str(exc)
@@ -865,12 +920,58 @@ class MainWindow(QMainWindow):
     # ── Open video signal handler ─────────────────────────────────────────────
     @pyqtSlot(str)
     def _on_open_video(self, path: str):
-        """Open a video in the OS default player."""
+        """Double-click → expand the video to fill the whole app and play it
+        here (HW-accelerated, in-app). Falls back to the OS default player only
+        if the in-app player can't be created."""
+        self._show_fullscreen_player(path)
+
+    def _show_fullscreen_player(self, path: str):
+        if not path or not os.path.isfile(path):
+            return
+        # Stop any hover preview so it doesn't compete with playback for disk.
+        try:
+            self._grid.pause_all_playback()
+        except Exception:
+            pass
+        if getattr(self, '_fs_player', None) is None:
+            try:
+                from fullscreen_player import FullscreenVideoPlayer
+            except Exception as e:
+                log.error("in-app player unavailable, using OS player: %s", e, exc_info=True)
+                self._open_external(path)
+                return
+            self._fs_player = FullscreenVideoPlayer(self)
+            self._fs_player.closed.connect(self._on_fullscreen_closed)
+        self._fs_player.setGeometry(self.rect())   # cover the entire app
+        self._fs_player.show()
+        self._fs_player.raise_()
+        self._fs_player.setFocus()
+        self._fs_player.play(path)
+
+    @pyqtSlot()
+    def _on_fullscreen_closed(self):
+        fs = getattr(self, '_fs_player', None)
+        if fs is not None:
+            fs.hide()
+        try:
+            self._grid.setFocus()
+        except Exception:
+            pass
+
+    def _open_external(self, path: str):
+        """Open `path` in the OS default player (fallback)."""
         try:
             os.startfile(path)
         except AttributeError:
             import subprocess
             subprocess.Popen(['xdg-open', path])
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # Keep the full-screen player covering the whole window as it resizes.
+        fs = getattr(self, '_fs_player', None)
+        if fs is not None and fs.isVisible():
+            fs.setGeometry(self.rect())
 
     def _build_status_bar(self):
         self._status = QStatusBar(self)
@@ -998,6 +1099,9 @@ class MainWindow(QMainWindow):
     @pyqtSlot(list, list)
     def _on_move_all_done(self, moved: list, errors: list):
         """Called on the main thread when all moves are complete."""
+        # Capture the actual src→dst mapping BEFORE releasing the worker, so the
+        # undo can find files that landed under a collision-unique name.
+        moved_to = dict(getattr(self._move_worker, 'moved_to', {}) or {})
         for p in moved:
             self._cache.invalidate(p)   # invalidate for both files and folders
         self._grid.remove_paths(moved)
@@ -1008,10 +1112,15 @@ class MainWindow(QMainWindow):
             dest = self._pending_move_dest
             moved_set = set(moved)
             orig_paths = [p for p in self._pending_move_orig_paths if p in moved_set]
+            # Record the REAL destination of each file (handles unique-renamed
+            # collisions); fall back to dest/basename for safety.
+            dest_paths = [moved_to.get(p, os.path.join(dest, os.path.basename(p)))
+                          for p in orig_paths]
             self._undo_stack.append(_UndoOp(
                 kind='move',
                 orig_paths=orig_paths,
                 dest=dest,
+                dest_paths=dest_paths,
             ))
             self._act_undo.setEnabled(True)
 
@@ -1036,56 +1145,69 @@ class MainWindow(QMainWindow):
         self._move_worker = None
 
     def _try_delete_with_retry(self, path: str) -> 'str | None':
-        """Delete one file/folder. Retries up to 8 times with 0.5s backoff
-        on PermissionError / sharing violation — these clear as soon as
-        cv2 / antivirus releases the handle. Returns None on success, or
-        the final error message string on permanent failure."""
+        """PERMANENTLY delete one file/folder — a real delete, NOT a move to the
+        Recycle Bin (the user's explicit requirement; the confirm dialog in
+        _on_delete is the safety gate). Retries up to 8 times with 0.5s backoff
+        on PermissionError / sharing violation (WinError 5/32) — these clear as
+        soon as cv2 / PyAV / antivirus releases the handle — and clears a
+        read-only attribute before retrying (os.remove refuses read-only files
+        that send2trash used to handle). Returns None on success, or the final
+        error string on permanent failure.
+
+        NOTE: this no longer uses send2trash for ANY path (local or UNC). A real
+        delete is wanted everywhere, and a UNC share has no Recycle Bin anyway —
+        so the local and network paths are now identical."""
         import time
+        import stat
         if not path:
             return "empty path"
-        # Normalize separators FIRST. A network folder reached via a Qt-supplied
-        # root uses forward slashes ("//server/share/…") which, joined with
-        # os.path.join, become MIXED ("//server/share\\sub"). The Windows shell
-        # API that send2trash uses (SHCreateItemFromParsingName) cannot resolve
-        # forward-slash / mixed UNC paths, so the delete silently failed.
-        # normpath yields a proper backslash path / UNC ("\\server\share\sub").
+        # Normalize separators FIRST. A path reached via a Qt-supplied root uses
+        # forward slashes ("D:/Videos/x" or "//server/share/…") which, joined with
+        # os.path.join, become MIXED ("//server/share\\sub") that the Windows
+        # file APIs can't resolve → the delete silently failed. normpath yields a
+        # proper backslash path / UNC ("\\server\share\sub").
         path = os.path.normpath(path)
-        # Safety net: never delete a relative path (would hit the CWD).
+        # Safety net: never delete a relative path (would resolve against CWD).
         if not os.path.isabs(path):
             return f"refusing to delete non-absolute path: {path}"
-        # UNC / network share (\\server\share\…): there is no Recycle Bin on a
-        # network location, so send2trash cannot recycle it (and can hang or
-        # error). Delete it directly — that is the only option, and exactly what
-        # Windows Explorer does for network paths.
-        is_unc = path.startswith('\\\\')
+
+        def _clear_readonly(func, p, _exc):
+            # rmtree onerror: a read-only file inside the tree blocks deletion —
+            # clear the bit and retry that one entry.
+            try:
+                os.chmod(p, stat.S_IWRITE)
+                func(p)
+            except OSError:
+                pass
+
         _DELETE_RETRIES     = 8
         _DELETE_RETRY_DELAY = 0.5
         last_err = ''
 
         for attempt in range(_DELETE_RETRIES):
             try:
-                if _HAS_SEND2TRASH and not is_unc:
-                    send2trash.send2trash(path)   # local → Recycle Bin
+                if os.path.isdir(path) and not os.path.islink(path):
+                    shutil.rmtree(path, onerror=_clear_readonly)
                 else:
-                    if os.path.isdir(path):
-                        shutil.rmtree(path)
-                    else:
-                        os.remove(path)
-                return None   # success
+                    os.remove(path)
+                return None   # success — permanently gone
+            except FileNotFoundError as e:
+                # Already gone / never existed — report once, don't spin 8×.
+                return str(e)
             except (PermissionError, OSError) as e:
                 last_err = str(e)
-                # PermissionError / WinError 5/32 → file still locked,
-                # retry. Other errors (not found, etc.) → give up.
+                # PermissionError / WinError 5/32 → still locked OR read-only.
+                # Clear the read-only bit and retry; other errors → give up.
                 winerror = getattr(e, 'winerror', None)
-                if (isinstance(e, PermissionError)
-                        or winerror in (5, 32)):
+                if isinstance(e, PermissionError) or winerror in (5, 32):
+                    try:
+                        os.chmod(path, stat.S_IWRITE)
+                    except OSError:
+                        pass
                     if attempt < _DELETE_RETRIES - 1:
                         time.sleep(_DELETE_RETRY_DELAY)
                         continue
                 return last_err
-            except Exception as e:
-                # send2trash can raise its own classes — treat as terminal
-                return str(e)
         return last_err
 
     def _release_video_handles(self):
@@ -1105,11 +1227,15 @@ class MainWindow(QMainWindow):
             return
         names = "\n".join(os.path.basename(p) for p in paths[:20])
         suffix = f"\n…and {len(paths) - 20} more" if len(paths) > 20 else ""
-        verb = "recycle" if _HAS_SEND2TRASH else "permanently delete"
+        # Delete is now a PERMANENT delete (not the Recycle Bin) — make the
+        # irreversibility explicit, since this dialog is the only safety gate.
         reply = QMessageBox.question(
-            self, "Confirm delete",
-            f"Are you sure you want to {verb} {len(paths)} item(s)?\n\n{names}{suffix}",
+            self, "Confirm permanent delete",
+            f"Permanently delete {len(paths)} item(s)?\n"
+            f"This cannot be undone — the file(s) will NOT go to the Recycle Bin.\n\n"
+            f"{names}{suffix}",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Cancel,   # default to the safe choice
         )
         if reply != QMessageBox.StandardButton.Yes:
             return
@@ -1146,21 +1272,22 @@ class MainWindow(QMainWindow):
         if op.kind == 'delete':
             QMessageBox.information(
                 self, "Undo Delete",
-                "Items were sent to the Recycle Bin.\n"
-                "Use File Explorer to restore deleted items."
+                "Deletes are permanent and cannot be undone — the file(s) were "
+                "not sent to the Recycle Bin."
             )
         elif op.kind == 'move':
-            # Files are now at dest/basename(orig_path); move them back
-            dest_paths = [
-                os.path.join(op.dest, os.path.basename(p))
-                for p in op.orig_paths
-            ]
-            if op.orig_paths:
-                back_dest = os.path.dirname(op.orig_paths[0])
-            else:
+            if not op.orig_paths:
                 return
+            # Use the REAL destination paths recorded at move time (so we move
+            # OUR files back, not a pre-existing same-named file that a collision
+            # caused us to rename around). Fall back to dest/basename for old
+            # undo entries created before this field existed.
+            cur_paths = op.dest_paths or [
+                os.path.join(op.dest, os.path.basename(p)) for p in op.orig_paths
+            ]
+            back_dest = os.path.dirname(op.orig_paths[0])
             # Only move files that actually exist at dest
-            to_move = [p for p in dest_paths if os.path.exists(p)]
+            to_move = [p for p in cur_paths if os.path.exists(p)]
             if not to_move:
                 QMessageBox.information(self, "Undo", "No files to undo.")
                 return
@@ -1573,6 +1700,11 @@ class MainWindow(QMainWindow):
         self._settings.window_geometry = self.saveGeometry()
         self._settings.splitter_state = self._splitter.saveState()
 
+        # Stop in-app playback so QMediaPlayer releases the file + audio cleanly.
+        fs = getattr(self, '_fs_player', None)
+        if fs is not None:
+            fs.stop()
+
         # ── stop all background QThreads before the window is destroyed ──────
         # Failing to wait here causes "QThread: Destroyed while thread is still
         # running", which crashes the process on exit.
@@ -1642,15 +1774,36 @@ class MainWindow(QMainWindow):
             stuck = qthread_registry.wait_all(3000)
         except Exception as e:
             log.warning("thread drain on close failed: %s", e)
-        if stuck:
-            log.warning("%d background thread(s) still running at close — forcing "
-                        "immediate exit to avoid a QThread teardown crash", stuck)
-            try:
-                import logging
-                logging.shutdown()
-            except Exception:
-                pass
-            os._exit(0)
 
-        log.info("All background threads stopped — closing window")
-        super().closeEvent(event)
+        if stuck:
+            log.warning("%d background thread(s) still running at close", stuck)
+        try:
+            self._settings.sync()          # persist geometry/splitter before exit
+        except Exception:
+            pass
+
+        # Tests disable the hard exit (it would kill the pytest runner); they
+        # have no stuck native workers, so a graceful close is safe there.
+        if os.environ.get('VORG_NO_HARD_EXIT'):
+            log.info("All background threads stopped — closing window (graceful)")
+            super().closeEvent(event)
+            return
+
+        # ── PRODUCTION: ALWAYS hard-exit — never run Qt's C++ teardown ───────
+        # Even when wait_all() reported 0 stuck, a QThread can still be destroyed
+        # mid-run during super().closeEvent()/QApplication teardown:
+        #   • one that FINISHED between wait_all() and now is briefly still inside
+        #     QThreadPrivate::finish() with isRunning()==True, or
+        #   • a hover/shimmer QTimer that armed a NEW preview after the drain.
+        # Either aborts with "QThread: Destroyed while thread is still running"
+        # (logged repeatedly over weeks, incl. right AFTER a clean drain). State
+        # is fully persisted above, so skip the C++ destructors entirely and let
+        # the OS reclaim every thread + file handle — os._exit can't be raced by
+        # ~QThread the way a graceful teardown can.
+        log.info("Hard exit on close (skip Qt teardown to avoid QThread crash)")
+        try:
+            import logging
+            logging.shutdown()
+        except Exception:
+            pass
+        os._exit(0)

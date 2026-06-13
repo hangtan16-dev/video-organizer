@@ -151,3 +151,64 @@ def test_folder_restore_applies_when_user_idle(qapp, tmp_path):
     finally:
         grid.close()
         qapp.processEvents()
+
+
+# ── second source of the "jumps back up" glitch: focus-driven auto-scroll ──────
+# A QScrollArea auto-scrolls to keep its FOCUSED child visible. So when a card's
+# checkbox gets focus (the user clicks it to select), then the user scrolls that
+# card off-screen, virtualization recycles it; Qt reassigns focus to another
+# card's checkbox elsewhere; the scroll area then teleports the view to that
+# newly-focused widget — the screen "jumps back up". The 30s soak
+# (tests/integration/scroll_jump_test.py) reproduced this as 35 jumps up to
+# ~38000 px. Fix: NO card child may accept keyboard focus — clicks still toggle
+# the checkbox, but nothing focusable lives inside the scroll area, so the
+# ensure-focused-visible auto-scroll can never fire. The grid itself keeps focus
+# for keyboard navigation (it draws its own focus indicator).
+
+def test_video_card_children_are_not_focusable(qapp):
+    """Every child of a VideoThumbnailWidget must be NoFocus (the checkbox, the
+    seek slider and the stars rating in particular). A focusable child is what
+    lets QScrollArea yank the view back to it on scroll."""
+    from PyQt6.QtWidgets import QWidget
+    from PyQt6.QtCore import Qt
+    from video_thumbnail_widget import VideoThumbnailWidget
+
+    w = VideoThumbnailWidget("fake_video.mp4", 1.0)
+    try:
+        # The interactive controls that DEFAULT to focusable must be NoFocus.
+        for name in ("_checkbox", "_seek_slider", "_stars_widget"):
+            child = getattr(w, name)
+            assert child.focusPolicy() == Qt.FocusPolicy.NoFocus, (
+                f"{name} is focusable ({child.focusPolicy()}) — a focused card "
+                f"child makes QScrollArea auto-scroll to it (scroll jumps back)"
+            )
+        # Future-proof: NO descendant widget anywhere may accept focus.
+        focusable = [c for c in w.findChildren(QWidget)
+                     if c.focusPolicy() != Qt.FocusPolicy.NoFocus]
+        assert not focusable, (
+            "card descendants accept focus: "
+            + ", ".join(f"{type(c).__name__}({c.focusPolicy()})" for c in focusable)
+        )
+    finally:
+        w.deleteLater()
+        qapp.processEvents()
+
+
+def test_folder_card_children_are_not_focusable(qapp):
+    """Same invariant for the folder card (its checkbox must be NoFocus)."""
+    from PyQt6.QtWidgets import QWidget
+    from PyQt6.QtCore import Qt
+    from folder_thumbnail_widget import FolderThumbnailWidget
+
+    w = FolderThumbnailWidget("C:/fake/folder", child_count=3, video_count=2)
+    try:
+        assert w._checkbox.focusPolicy() == Qt.FocusPolicy.NoFocus
+        focusable = [c for c in w.findChildren(QWidget)
+                     if c.focusPolicy() != Qt.FocusPolicy.NoFocus]
+        assert not focusable, (
+            "folder card descendants accept focus: "
+            + ", ".join(f"{type(c).__name__}({c.focusPolicy()})" for c in focusable)
+        )
+    finally:
+        w.deleteLater()
+        qapp.processEvents()

@@ -27,6 +27,15 @@ class AppSettings:
         os.makedirs(self._cache_dir, exist_ok=True)
         os.makedirs(self._app_dir, exist_ok=True)
 
+    def sync(self):
+        """Flush pending settings writes to disk. Call before a hard exit
+        (os._exit) so geometry/splitter/last-folder etc. actually persist —
+        os._exit skips QSettings' normal destructor-time sync."""
+        try:
+            self._settings.sync()
+        except Exception:
+            pass
+
     @property
     def seek_time(self) -> float:
         return float(self._settings.value('seek_time', self.DEFAULT_SEEK_TIME))

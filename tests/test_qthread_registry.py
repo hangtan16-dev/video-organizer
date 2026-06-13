@@ -160,8 +160,11 @@ def test_install_function_exists_and_signature():
         def __init__(self):
             self.finished = FakeSignal()
             self._running = True
+            self._finished = False
         def isRunning(self):
             return self._running
+        def isFinished(self):
+            return self._finished
         def deleteLater(self):
             pass
 
@@ -180,8 +183,35 @@ def test_install_function_exists_and_signature():
 
     # Once the thread has fully finished, the reaper removes it.
     t._running = False
+    t._finished = True
     qthread_registry._reaper.reap()
     assert t not in qthread_registry._running
+
+
+def test_reaper_keeps_not_started_thread():
+    """REGRESSION (0xC0000409 crash): a thread that is registered but NEVER
+    STARTED — isRunning()==False AND isFinished()==False, exactly a preview
+    deferred by PREVIEW_MANAGER — must NOT be reaped. The old `not isRunning()`
+    test deleteLater'd it, then PREVIEW_MANAGER._launch() start()ed the deleted
+    QThread → 'QThread: Destroyed while thread is still running' abort. The
+    reaper must only reap FINISHED threads."""
+    qthread_registry._running.clear()
+
+    class _Pending:
+        def __init__(self):
+            self.finished = type('S', (), {'connect': lambda *a, **k: None})()
+        def isRunning(self):
+            return False     # never started
+        def isFinished(self):
+            return False     # …and never finished → will be launched later
+        def deleteLater(self):
+            raise AssertionError("a not-yet-started thread must NOT be deleted")
+
+    t = _Pending()
+    qthread_registry.install(t)
+    qthread_registry._reaper.reap()
+    assert t in qthread_registry._running, "pending thread was wrongly reaped"
+    qthread_registry._running.discard(t)
 
 
 # ── runtime: real QThreads reaped without the teardown deadlock ──────────────

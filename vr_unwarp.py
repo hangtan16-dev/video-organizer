@@ -55,7 +55,9 @@ def detect_projection(path: str) -> str:
     '180'/'360' are matched as standalone tokens (not flanked by other digits),
     so '3600', '1800', '1080' etc. don't count."""
     n = os.path.basename(path).lower()
-    if re.search(r'fisheye|fish|mkx|vrca|rf52|_f1[789]\d|_f2[0-2]\d', n):
+    # 'fisheye' as a whole word, or 'fish' ONLY when followed by a FOV number
+    # (fish190 / fish_200) — NOT inside ordinary words like "fishing".
+    if re.search(r'fisheye|fish[ _\-]?\d|mkx|vrca|rf52|_f1[789]\d|_f2[0-2]\d', n):
         return PROJ_FISHEYE
     if re.search(r'(?<!\d)180(?!\d)', n):
         return PROJ_EQUIRECT_180
@@ -218,6 +220,42 @@ def _clamped_uv(dx, dy, dz, projection, lens_fov_deg):
         u = 0.5 + max(-math.pi / 2, min(math.pi / 2, lon)) / math.pi
         v = 0.5 - max(-math.pi / 2, min(math.pi / 2, lat)) / math.pi
     return min(1.0, max(0.0, u)), min(1.0, max(0.0, v))
+
+
+def halves_look_stereo(frame, min_corr=0.6):
+    """For a ~2:1 frame, True if the LEFT and RIGHT halves look like a stereo
+    PAIR (nearly the same image — side-by-side VR) rather than two different
+    parts of one 2D scene (e.g. a 2:1 'fishing' clip). Cheap normalized
+    correlation on downscaled, mean-removed halves.
+
+    CONSERVATIVE by design: a real SBS pair's halves correlate ~0.85–0.98, so a
+    0.6 threshold virtually never rejects genuine VR; it only filters out a 2:1
+    *2D* video whose halves are clearly different. On any error / blank frame it
+    returns True (assume VR) so detection is never broken by this guard."""
+    try:
+        import numpy as np
+        import cv2
+        h, w = frame.shape[:2]
+        half = w // 2
+        if h < 4 or half < 4:
+            return True
+        s = 48
+
+        def prep(x):
+            g = x.astype(np.float32)
+            if g.ndim == 3:
+                g = g.mean(axis=2)
+            g = cv2.resize(g, (s, s))
+            return g - g.mean()
+
+        left = prep(frame[:, :half])
+        right = prep(frame[:, half:half * 2])
+        denom = float(np.sqrt((left * left).sum()) * np.sqrt((right * right).sum()))
+        if denom < 1e-6:
+            return True                      # flat/blank → can't tell → assume VR
+        return float((left * right).sum() / denom) >= min_corr
+    except Exception:
+        return True
 
 
 def is_sbs_aspect(w, h):

@@ -701,6 +701,8 @@ class VideoThumbnailWidget(QFrame):
             ptr = img.constBits(); ptr.setsize(h * bpl)
             arr = (np.frombuffer(ptr, np.uint8).reshape(h, bpl)[:, :w * 3]
                    .reshape(h, w, 3))
+            if not vu.halves_look_stereo(arr):
+                return None      # 2:1 but a 2D scene (halves differ) → don't un-warp
             if getattr(self, '_thumb_unwarper', None) is None:
                 self._thumb_unwarper = _make_frame_unwarper(self.video_path, eye='left')
             flat = np.ascontiguousarray(self._thumb_unwarper.apply(arr))

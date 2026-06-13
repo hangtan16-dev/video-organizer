@@ -736,6 +736,8 @@ class _PyAVPlayThread(QThread):
             return arr           # not fully initialised (unit-test __new__) → no-op
         if eye == '?':
             eye = vu.detect_stereo_eye(src_w, src_h)
+            if eye is not None and not vu.halves_look_stereo(arr):
+                eye = None        # 2:1 but a 2D scene (halves differ) → not VR
             self._vr_eye = eye
             if eye is not None:
                 try:

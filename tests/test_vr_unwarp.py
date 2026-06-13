@@ -282,6 +282,34 @@ def test_detect_projection_prioritises_180_and_tokens():
     assert vu.detect_projection("plain_movie.mp4")       == vu.PROJ_EQUIRECT_180   # default
 
 
+def test_detect_projection_ignores_the_word_fishing():
+    # 'fishing' / 'selfish' contain 'fish' but are NOT fisheye
+    assert vu.detect_projection("Gone_Fishing_8K.mp4") == vu.PROJ_EQUIRECT_180
+    assert vu.detect_projection("selfish_clip.mp4")    == vu.PROJ_EQUIRECT_180
+    # real fisheye tags (fish + a FOV number, or 'fisheye') still match
+    assert vu.detect_projection("clip_fisheye190.mp4")   == vu.PROJ_FISHEYE
+    assert vu.detect_projection("clip_fish190.mp4")      == vu.PROJ_FISHEYE
+    assert vu.detect_projection("scene_fish_200_lr.mp4") == vu.PROJ_FISHEYE
+
+
+def test_halves_look_stereo_distinguishes_sbs_from_2d():
+    import numpy as np
+    yy, xx = np.mgrid[0:120, 0:100].astype(np.float32)
+    eye = np.stack([(xx * 2) % 256, (yy * 2) % 256, (xx + yy) % 256],
+                   axis=2).astype(np.uint8)               # structured "eye"
+    # SBS pair: identical halves, and a small-parallax (4px) variant → stereo
+    assert vu.halves_look_stereo(np.concatenate([eye, eye], axis=1)) is True
+    assert vu.halves_look_stereo(
+        np.concatenate([eye, np.roll(eye, 4, axis=1)], axis=1)) is True
+    # 2D 2:1: left is a L→R gradient, right its mirror (anti-correlated) → NOT stereo
+    g = np.tile(np.linspace(0, 255, 100, dtype=np.float32), (120, 1))
+    left = np.stack([g, g, g], axis=2).astype(np.uint8)
+    right = left[:, ::-1].copy()
+    assert vu.halves_look_stereo(np.concatenate([left, right], axis=1)) is False
+    # a flat/blank frame can't be judged → assume VR (never breaks detection)
+    assert vu.halves_look_stereo(np.zeros((100, 200, 3), np.uint8)) is True
+
+
 def test_detect_lens_fov_from_tags():
     assert vu.detect_lens_fov("scene_fisheye190.mp4") == 190.0
     assert vu.detect_lens_fov("clip_MKX200.mp4")      == 200.0

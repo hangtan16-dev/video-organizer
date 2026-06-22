@@ -111,6 +111,10 @@ class DiskAccessCoordinator:
         self._fg_waiting = 0
         # True while a foreground op is actively using the disk (exclusive).
         self._fg_active = False
+        # True while ALL background work is paused indefinitely (e.g. the
+        # full-screen player owns the disk for the whole duration of playback).
+        # Distinct from _fg_active, which is a transient preview/seek burst.
+        self._bg_paused = False
         # Label of the current foreground holder (None when idle). end_
         # foreground() only releases if the caller's label matches this, so a
         # stopped-but-still-unwinding preview can't clear a newer preview's
@@ -169,7 +173,7 @@ class DiskAccessCoordinator:
         try:
             with self._cond:
                 while True:
-                    if self._fg_active or self._fg_waiting > 0:
+                    if self._fg_active or self._fg_waiting > 0 or self._bg_paused:
                         self._cond.wait()
                         continue
                     since = time.monotonic() - self._last_fg_release
@@ -329,6 +333,26 @@ class DiskAccessCoordinator:
             self._last_fg_release = time.monotonic()
             self._cond.notify_all()
 
+    def set_background_paused(self, paused: bool) -> None:
+        """Pause/resume ALL background thumbnail work for an extended period —
+        e.g. while the in-app full-screen player owns the disk. Unlike a
+        foreground preview (a transient burst gated by begin/end_foreground),
+        playback can run for minutes, so this is a simple held flag.
+
+        GUI-thread SAFE and non-blocking: it only sets the flag, wakes parked
+        workers, and (on resume) applies the normal post-foreground cooldown so
+        a quick open→close doesn't immediately re-thrash the disk. Like
+        note_ui_activity(), it does NOT force-close in-flight work from the GUI
+        (a blocking file.close() would freeze the GUI); the one bg decode that
+        may already be running winds down on its own, after which background
+        stays parked until resumed. New background sections block immediately.
+        """
+        with self._cond:
+            self._bg_paused = bool(paused)
+            if not paused:
+                self._last_fg_release = time.monotonic()
+            self._cond.notify_all()
+
     # ── observability / diagnostics ──────────────────────────────────────
     def snapshot(self) -> dict:
         """Return a copy of current coordinator state for logging/tests."""
@@ -337,6 +361,7 @@ class DiskAccessCoordinator:
                 "fg_waiting": self._fg_waiting,
                 "fg_active": self._fg_active,
                 "bg_active": self._bg_active,
+                "bg_paused": self._bg_paused,
                 "registry": dict(self._registry),
             }
 
@@ -355,6 +380,7 @@ class DiskAccessCoordinator:
             self._fg_active = False
             self._fg_holder = None
             self._bg_active = 0
+            self._bg_paused = False
             self._bg_waiting.clear()
             self._bg_ticket_next = 0
             self._registry.clear()

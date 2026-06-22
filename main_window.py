@@ -947,9 +947,24 @@ class MainWindow(QMainWindow):
         self._fs_player.raise_()
         self._fs_player.setFocus()
         self._fs_player.play(path)
+        # The player + its read-ahead now own the disk. Pause BACKGROUND
+        # thumbnail generation for the duration so its decodes don't thrash the
+        # HDD against playback — that contention stalled thumbnail generation
+        # (and could stutter playback). Resumed in _on_fullscreen_closed.
+        try:
+            from disk_coordinator import COORDINATOR
+            COORDINATOR.set_background_paused(True)
+        except Exception:
+            pass
 
     @pyqtSlot()
     def _on_fullscreen_closed(self):
+        # Playback is over → let background thumbnail generation run again.
+        try:
+            from disk_coordinator import COORDINATOR
+            COORDINATOR.set_background_paused(False)
+        except Exception:
+            pass
         fs = getattr(self, '_fs_player', None)
         if fs is not None:
             fs.hide()

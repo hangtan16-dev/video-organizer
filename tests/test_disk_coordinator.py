@@ -216,3 +216,38 @@ def test_begin_foreground_clean_acquire_returns_true():
     assert c.snapshot()["fg_active"] is True
     c.end_foreground("fg")
     assert c.snapshot()["fg_active"] is False
+
+
+def test_set_background_paused_blocks_until_resumed():
+    """While paused (the in-app full-screen player owns the disk), a background
+    section must NOT enter; once resumed it proceeds. This is the fix for
+    thumbnail generation stalling/thrashing during full-screen playback."""
+    c = DiskAccessCoordinator()
+    c.BACKGROUND_COOLDOWN_S = 0.0          # isolate pause logic from the cooldown
+    c.set_background_paused(True)
+    assert c.snapshot()["bg_paused"] is True
+
+    entered = threading.Event()
+
+    def worker():
+        with c.background_section("w", "/vid/x.mp4"):
+            entered.set()
+            time.sleep(0.05)
+
+    t = threading.Thread(target=worker)
+    t.start()
+    # Must NOT enter while paused.
+    assert not entered.wait(0.4), "background entered the disk while paused"
+    # Resume → it proceeds.
+    c.set_background_paused(False)
+    assert entered.wait(2.0), "background did not resume after unpause"
+    t.join(timeout=3.0)
+    assert not t.is_alive()
+    assert c.snapshot()["bg_paused"] is False
+
+
+def test_reset_clears_background_paused():
+    c = DiskAccessCoordinator()
+    c.set_background_paused(True)
+    c.reset()
+    assert c.snapshot()["bg_paused"] is False
